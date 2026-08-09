@@ -1,0 +1,56 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+.fleet/
+.helix/
+
+# OS
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+
+# Test artifacts
+/test-repos/
+/test-data/
+/coverage/
+
+# Claude sync test data
+.claude-code-sync-test/
+test-backup/
+
+# Local session artifacts (plans, agent scratch)
+.claude/
+
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Documentation build
+/book/
+/docs/_build/
+
+# Logs
+*.log
+*.log.*
+
+# Local notes and agent artifacts
+/local/
+/.superpowers/
+
+# Raw session data and accidentally exported transcripts
+/data/
+/docs/rollout-*.jsonl
