@@ -113,6 +113,22 @@ impl ConfigManager {
         Ok(Self::config_dir()?.join("session-maintenance.lock"))
     }
 
+    /// Get the lock file guarding write access to one sync repository.
+    ///
+    /// The name is derived from the repository path so several repositories
+    /// never share a lock. It lives in the config dir rather than inside the
+    /// repository itself, so the lock is available even before the repository
+    /// is initialized, and never risks being committed.
+    #[allow(dead_code)]
+    pub fn sync_repo_lock_path(repo_path: &std::path::Path) -> Result<PathBuf> {
+        // Canonicalize so that `/a/b`, `/a/b/` and a symlinked alias map to the
+        // same lock; fall back to the literal path when it does not exist yet.
+        let identity = std::fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+        let digest = blake3::hash(identity.to_string_lossy().as_bytes());
+        let short = &digest.to_hex()[..16];
+        Ok(Self::config_dir()?.join(format!("sync-repo-{short}.lock")))
+    }
+
     /// Get the session recycle directory path.
     #[allow(dead_code)]
     pub fn session_recycle_dir() -> Result<PathBuf> {

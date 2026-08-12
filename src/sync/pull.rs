@@ -348,6 +348,18 @@ pub fn pull_history(
     }
 
     let state = SyncState::load()?;
+
+    // Serialize against any other process writing this repository — a pull
+    // rebases and rewrites the working tree, so it cannot overlap a push.
+    let Some(_repo_lock) = crate::sync::repo_lock::RepoLock::acquire_or_report(
+        &state.sync_repo_path,
+        "拉取",
+        verbosity,
+    )?
+    else {
+        return Ok(());
+    };
+
     let repo = scm::open(&state.sync_repo_path)?;
     let filter = FilterConfig::load()?;
     let claude_dir = claude_projects_dir()?;

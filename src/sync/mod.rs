@@ -5,6 +5,7 @@ mod init;
 mod pull;
 mod push;
 mod remote;
+pub(crate) mod repo_lock;
 mod state;
 mod status;
 pub mod tombstone;

@@ -154,11 +154,24 @@ pub fn push_config_files(settings: &ConfigSyncSettings) -> Result<Vec<String>> {
 pub fn handle_config_push(settings: &ConfigSyncSettings) -> Result<()> {
     let device_name = settings.get_device_name();
 
+    let sync_state = SyncState::load()?;
+
+    // Taken before push_config_files, not just around the commit: copying the
+    // config files already writes into the repository working tree, which must
+    // not interleave with another process staging or rebasing it.
+    let Some(_repo_lock) = crate::sync::repo_lock::RepoLock::acquire_or_report(
+        &sync_state.sync_repo_path,
+        "配置推送",
+        crate::VerbosityLevel::Normal,
+    )?
+    else {
+        return Ok(());
+    };
+
     let synced_files = push_config_files(settings)?;
 
     // Commit and push
     if !synced_files.is_empty() {
-        let sync_state = SyncState::load()?;
         let sync_repo = sync_state.sync_repo_path.clone();
         let message = format!("Sync config from {}", device_name);
         let repo = scm::open(&sync_repo)?;

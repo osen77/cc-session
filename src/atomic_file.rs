@@ -1,11 +1,12 @@
 use anyhow::{bail, Context, Result};
-use fs4::FileExt;
+use fs4::{FileExt, TryLockError};
 use serde::Serialize;
 #[cfg(test)]
 use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
 pub(crate) struct FileLock {
@@ -14,23 +15,79 @@ pub(crate) struct FileLock {
 
 impl FileLock {
     pub(crate) fn acquire(lock_path: &Path) -> Result<Self> {
-        reject_lock_symlink_if_present(lock_path)?;
-        let parent = lock_path.parent().context("lock path has no parent")?;
-        std::fs::create_dir_all(parent)?;
-        let mut options = OpenOptions::new();
-        options.create(true).read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW);
-            options.mode(0o600);
-        }
-        let file = options.open(lock_path)?;
-        validate_open_lock_path(lock_path)?;
-        set_private_file_permissions(&file)?;
+        let file = open_lock_file(lock_path)?;
         FileExt::lock(&file)?;
         Ok(Self { file })
     }
+
+    /// Attempt to acquire the lock without blocking.
+    ///
+    /// Returns `Ok(None)` when another process holds the lock, and `Err` only
+    /// for real failures (bad path, permissions, I/O). Callers that must not
+    /// stall — hooks, wrappers, anything with a harness timeout — use this
+    /// instead of [`FileLock::acquire`].
+    pub(crate) fn try_acquire(lock_path: &Path) -> Result<Option<Self>> {
+        let file = open_lock_file(lock_path)?;
+        match FileExt::try_lock(&file) {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("failed to lock {}", lock_path.display()))
+            }
+        }
+    }
+
+    /// Poll for the lock until `timeout` elapses.
+    ///
+    /// Returns `Ok(None)` if the lock was still held when the deadline passed.
+    /// Used for interactive invocations, where the user expects the command to
+    /// actually run rather than silently no-op.
+    pub(crate) fn acquire_with_timeout(
+        lock_path: &Path,
+        timeout: Duration,
+        mut on_wait: impl FnMut(),
+    ) -> Result<Option<Self>> {
+        if let Some(lock) = Self::try_acquire(lock_path)? {
+            return Ok(Some(lock));
+        }
+        on_wait();
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            std::thread::sleep(LOCK_POLL_INTERVAL);
+            if let Some(lock) = Self::try_acquire(lock_path)? {
+                return Ok(Some(lock));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+        }
+    }
+}
+
+/// Interval between polls in [`FileLock::acquire_with_timeout`].
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Open (creating if needed) a lock file, rejecting symlinks at every step.
+///
+/// Shared by every acquire variant so the symlink, `O_NOFOLLOW` and private
+/// permission guarantees cannot drift apart between them.
+fn open_lock_file(lock_path: &Path) -> Result<File> {
+    reject_lock_symlink_if_present(lock_path)?;
+    let parent = lock_path.parent().context("lock path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+        options.mode(0o600);
+    }
+    let file = options.open(lock_path)?;
+    validate_open_lock_path(lock_path)?;
+    set_private_file_permissions(&file)?;
+    Ok(file)
 }
 
 impl Drop for FileLock {
@@ -203,6 +260,82 @@ mod tests {
         assert!(!waiter.is_finished());
         drop(first);
         drop(waiter.join().unwrap());
+    }
+
+    #[test]
+    fn try_acquire_returns_none_while_held() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("state.lock");
+        let held = FileLock::acquire(&lock_path).unwrap();
+
+        // A second fd on the same file must observe contention rather than
+        // silently succeeding — flock is per-fd, not per-process.
+        let path = lock_path.clone();
+        let contended = std::thread::spawn(move || FileLock::try_acquire(&path).unwrap().is_none())
+            .join()
+            .unwrap();
+        assert!(contended, "try_acquire must report contention");
+
+        drop(held);
+        let path = lock_path.clone();
+        let free = std::thread::spawn(move || FileLock::try_acquire(&path).unwrap().is_some())
+            .join()
+            .unwrap();
+        assert!(free, "try_acquire must succeed once released");
+    }
+
+    #[test]
+    fn acquire_with_timeout_gives_up_and_reports_waiting() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("state.lock");
+        let _held = FileLock::acquire(&lock_path).unwrap();
+
+        let path = lock_path.clone();
+        let (waited, outcome) = std::thread::spawn(move || {
+            let mut waited = false;
+            let outcome = FileLock::acquire_with_timeout(
+                &path,
+                std::time::Duration::from_millis(600),
+                || waited = true,
+            )
+            .unwrap();
+            (waited, outcome.is_none())
+        })
+        .join()
+        .unwrap();
+
+        assert!(waited, "the wait callback must fire before polling");
+        assert!(
+            outcome,
+            "a held lock must time out rather than block forever"
+        );
+    }
+
+    #[test]
+    fn acquire_with_timeout_skips_callback_when_uncontended() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("state.lock");
+        let mut waited = false;
+        let lock = FileLock::acquire_with_timeout(
+            &lock_path,
+            std::time::Duration::from_millis(600),
+            || waited = true,
+        )
+        .unwrap();
+        assert!(lock.is_some());
+        assert!(!waited, "an uncontended lock must not announce waiting");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn try_acquire_rejects_symlink() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("session-maintenance.json");
+        let lock_path = dir.path().join("session-maintenance.lock");
+        std::fs::write(&state_path, b"{}").unwrap();
+        std::os::unix::fs::symlink(&state_path, &lock_path).unwrap();
+
+        assert!(FileLock::try_acquire(&lock_path).is_err());
     }
 
     #[test]

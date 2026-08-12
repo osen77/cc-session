@@ -4,7 +4,7 @@
 //! Supports listing, viewing, renaming, and deleting sessions with a
 //! hierarchical navigation interface.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use colored::Colorize;
 use inquire::{Confirm, Select, Text};
 use serde_json::json;
@@ -2001,6 +2001,19 @@ pub fn delete_session_with_commit(session: &SessionSummary, reason: DeleteReason
     };
 
     let state = SyncState::load()?;
+
+    // Deletion touches the local file, the repo copy and the tombstone registry
+    // as one unit, so the lock is taken before the first mutation. Unlike a
+    // push, a busy repository must NOT be treated as success here: the user
+    // explicitly asked for this session to go away, and silently skipping would
+    // report a deletion that never happened.
+    let _repo_lock = match crate::sync::repo_lock::RepoLock::acquire(&state.sync_repo_path)? {
+        crate::sync::repo_lock::RepoLockOutcome::Acquired(lock) => lock,
+        crate::sync::repo_lock::RepoLockOutcome::Busy => {
+            bail!("另一个同步正在进行，未删除会话；请稍后重试")
+        }
+    };
+
     let projects_dir = state.sync_repo_path.join(&filter.sync_subdirectory);
     // Validate the untrusted sync root before changing the local file. This
     // prevents a malformed checkout from causing a partial delete.
@@ -2881,6 +2894,26 @@ fn cleanup_sessions_interactive(project: &ProjectSummary) -> Result<usize> {
         Ok(true) => {
             let filter = FilterConfig::load()?;
             let state = SyncState::load().ok();
+
+            // One guard for the whole batch: the per-session repo removals and
+            // the single trailing commit form one unit, and re-acquiring per
+            // session would let another process interleave between them.
+            // Abort rather than half-apply if the repository is busy.
+            let _repo_lock = match state.as_ref() {
+                Some(st) => match crate::sync::repo_lock::RepoLock::acquire(&st.sync_repo_path)? {
+                    crate::sync::repo_lock::RepoLockOutcome::Acquired(lock) => Some(lock),
+                    crate::sync::repo_lock::RepoLockOutcome::Busy => {
+                        println!();
+                        println!(
+                            "{} 另一个同步正在进行，已取消本次清理；请稍后重试",
+                            "!".yellow().bold()
+                        );
+                        return Ok(0);
+                    }
+                },
+                None => None,
+            };
+
             let mut deleted_count = 0;
             let mut records: Vec<DeletionRecord> = Vec::new();
 

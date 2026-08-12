@@ -37,3 +37,7 @@ walkdir = "2.5"
 serde_json = "1.0.149"
 serial_test = "3.3.1"
 rstest = "0.26.1"
+# Lets integration tests hold the sync-repo lock from the test process itself,
+# so contention is deterministic instead of depending on process timing.
+fs4 = "1.1.0"
+tempfile = "3.24.0"

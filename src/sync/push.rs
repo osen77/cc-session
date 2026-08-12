@@ -513,6 +513,19 @@ pub fn push_history(
     }
 
     let mut state = SyncState::load()?;
+
+    // Serialize against any other process writing this repository. Held for the
+    // rest of the function; a busy repository means someone else is already
+    // syncing, so skipping is correct and must not be reported as a failure.
+    let Some(_repo_lock) = crate::sync::repo_lock::RepoLock::acquire_or_report(
+        &state.sync_repo_path,
+        "推送",
+        verbosity,
+    )?
+    else {
+        return Ok(());
+    };
+
     let repo = scm::open(&state.sync_repo_path)?;
     let mut filter = FilterConfig::load()?;
 
