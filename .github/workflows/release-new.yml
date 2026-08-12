@@ -222,29 +222,29 @@ jobs:
           cd -
         shell: pwsh
 
-      - name: Upload Release Asset (tarball)
-        if: matrix.os != 'windows-latest'
-        uses: softprops/action-gh-release@v2
+      # Build jobs deliberately do NOT touch the GitHub Release.
+      #
+      # They used to upload with softprops/action-gh-release and `draft: true`.
+      # A draft release has no real git ref, so the action cannot reliably find
+      # the existing draft by tag: five matrix jobs running in parallel each
+      # concluded none existed and created their own. v0.5.5 ended up with three
+      # drafts for one tag (0 + 2 + 8 assets), the verify step queried the empty
+      # one and failed, while every upload step still reported success.
+      #
+      # Artifacts have no such shared mutable target, so the fan-out stays
+      # conflict-free and all publishing happens from the single job below.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ needs.create-release.outputs.version }}
-          draft: true
-          files: |
-            target/${{ matrix.target }}/release/${{ matrix.asset_name }}.tar.gz
-            target/${{ matrix.target }}/release/${{ matrix.asset_name }}.tar.gz.sha256
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload Release Asset (zip)
-        if: matrix.os == 'windows-latest'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.create-release.outputs.version }}
-          draft: true
-          files: |
-            target/${{ matrix.target }}/release/${{ matrix.asset_name }}.zip
-            target/${{ matrix.target }}/release/${{ matrix.asset_name }}.zip.sha256
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: ${{ matrix.asset_name }}
+          # Globs rather than literal names: each platform produces either the
+          # tarball pair or the zip pair, and a non-matching glob is skipped
+          # while a missing literal path would be reported as a warning.
+          path: |
+            target/${{ matrix.target }}/release/${{ matrix.asset_name }}.tar.gz*
+            target/${{ matrix.target }}/release/${{ matrix.asset_name }}.zip*
+          if-no-files-found: error
+          retention-days: 7
 
   finalize-release:
     name: Verify and Publish GitHub Release
@@ -253,6 +253,23 @@ jobs:
       - build-release
     runs-on: ubuntu-latest
     steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Upload assets to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.create-release.outputs.version }}
+        run: |
+          ls -la release-assets
+          # Single writer, so no two jobs can race to create a draft. --clobber
+          # keeps a re-run idempotent instead of failing on existing names.
+          gh release upload "$VERSION" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
       - name: Verify complete release asset set
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
