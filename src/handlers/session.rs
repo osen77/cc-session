@@ -6,7 +6,9 @@
 
 use anyhow::{bail, Context, Result};
 use colored::Colorize;
-use inquire::{Confirm, Select, Text};
+use inquire::{Confirm, Text};
+
+use crate::nav_select::{NavOutcome, NavSelect};
 use serde_json::json;
 #[cfg(test)]
 use std::cell::RefCell;
@@ -2218,25 +2220,16 @@ fn show_project_menu(projects: &[ProjectSummary]) -> Result<ProjectMenuChoice> {
 
     options.push("Exit".to_string());
 
-    let selection = Select::new("Select a project:", options.clone())
-        .with_help_message("Use arrow keys to navigate, Enter to select")
-        .prompt();
-
-    match selection {
-        Ok(selected) => {
-            if selected == "Exit" {
-                Ok(ProjectMenuChoice::Exit)
-            } else if let Some(idx) = options.iter().position(|o| o == &selected) {
-                if idx < projects.len() {
-                    Ok(ProjectMenuChoice::Select(projects[idx].clone()))
-                } else {
-                    Ok(ProjectMenuChoice::Exit)
-                }
-            } else {
-                Ok(ProjectMenuChoice::Exit)
+    loop {
+        match NavSelect::new("Select a project:", options.clone()).prompt()? {
+            NavOutcome::Selected(idx) if idx < projects.len() => {
+                return Ok(ProjectMenuChoice::Select(projects[idx].clone()));
             }
+            NavOutcome::Selected(_) => return Ok(ProjectMenuChoice::Exit), // "Exit" row
+            // Top level has no parent: re-render instead of exiting.
+            NavOutcome::Back => continue,
+            NavOutcome::Cancel => return Ok(ProjectMenuChoice::Exit),
         }
-        Err(_) => Ok(ProjectMenuChoice::Exit),
     }
 }
 
@@ -2290,6 +2283,40 @@ fn build_session_menu_options(
     options
 }
 
+/// Semantic slots of the session menu, in `build_session_menu_options` order:
+/// `[Search, Session(0..n), Cleanup?, SwitchProject, Exit]`.
+enum SessionMenuSlot {
+    Search,
+    Session(usize),
+    Cleanup,
+    SwitchProject,
+    Exit,
+}
+
+/// Translate a menu index into its semantic slot. Must stay in lockstep with
+/// `build_session_menu_options`; out-of-range indices resolve to `Exit`.
+fn session_menu_slot(idx: usize, session_count: usize, cleanup_enabled: bool) -> SessionMenuSlot {
+    if idx == 0 {
+        return SessionMenuSlot::Search;
+    }
+    let idx = idx - 1;
+    if idx < session_count {
+        return SessionMenuSlot::Session(idx);
+    }
+    let mut tail = idx - session_count;
+    if cleanup_enabled {
+        if tail == 0 {
+            return SessionMenuSlot::Cleanup;
+        }
+        tail -= 1;
+    }
+    if tail == 0 {
+        SessionMenuSlot::SwitchProject
+    } else {
+        SessionMenuSlot::Exit
+    }
+}
+
 /// Show session selection menu for a project
 fn show_session_menu(
     project: &ProjectSummary,
@@ -2311,45 +2338,21 @@ fn show_session_menu(
         return Ok(SessionMenuChoice::SwitchProject);
     }
 
-    let search_option = "Search sessions...".to_string();
-    let cleanup_option = cleanup_enabled.then(|| {
-        if filtered_count > 0 {
-            format!("Cleanup [{}]", filtered_count)
-        } else {
-            "Cleanup [0]".to_string()
-        }
-    });
-    let switch_option = "Switch project".to_string();
-    let exit_option = "Exit".to_string();
     let options = build_session_menu_options(sessions, filtered_count, cleanup_enabled);
 
-    let selection = Select::new("Select a session:", options.clone())
-        .with_help_message("Use arrow keys to navigate, Enter to select")
-        .prompt();
-
-    match selection {
-        Ok(selected) => {
-            if selected == exit_option {
-                Ok(SessionMenuChoice::Exit)
-            } else if selected == switch_option {
-                Ok(SessionMenuChoice::SwitchProject)
-            } else if selected == search_option {
-                Ok(SessionMenuChoice::Search)
-            } else if cleanup_option.as_deref() == Some(selected.as_str()) {
-                Ok(SessionMenuChoice::Cleanup)
-            } else if let Some(idx) = options.iter().position(|o| o == &selected) {
-                // offset by 1 for the search option
-                let session_idx = idx - 1;
-                if session_idx < sessions.len() {
-                    Ok(SessionMenuChoice::Select(sessions[session_idx].clone()))
-                } else {
-                    Ok(SessionMenuChoice::SwitchProject)
-                }
-            } else {
-                Ok(SessionMenuChoice::Exit)
-            }
-        }
-        Err(_) => Ok(SessionMenuChoice::Exit),
+    match NavSelect::new("Select a session:", options).prompt()? {
+        NavOutcome::Selected(idx) => Ok(
+            match session_menu_slot(idx, sessions.len(), cleanup_enabled) {
+                SessionMenuSlot::Search => SessionMenuChoice::Search,
+                SessionMenuSlot::Session(i) => SessionMenuChoice::Select(sessions[i].clone()),
+                SessionMenuSlot::Cleanup => SessionMenuChoice::Cleanup,
+                SessionMenuSlot::SwitchProject => SessionMenuChoice::SwitchProject,
+                SessionMenuSlot::Exit => SessionMenuChoice::Exit,
+            },
+        ),
+        // ← goes back to the project menu.
+        NavOutcome::Back => Ok(SessionMenuChoice::SwitchProject),
+        NavOutcome::Cancel => Ok(SessionMenuChoice::Exit),
     }
 }
 
@@ -2459,33 +2462,22 @@ fn show_search_results(
     }
     println!();
 
-    let back_option = "Back to session list".to_string();
     let mut options: Vec<String> = results
         .iter()
         .enumerate()
         .map(|(i, (s, _))| format!("[{:>2}] {}", i + 1, s.display_title(50),))
         .collect();
-    options.push(back_option.clone());
+    options.push("Back to session list".to_string());
 
-    let selection = Select::new("Select a session:", options.clone())
-        .with_help_message("Use arrow keys to navigate, Enter to select")
-        .prompt();
-
-    match selection {
-        Ok(selected) => {
-            if selected == back_option {
-                Ok(SessionMenuChoice::SwitchProject) // reuse to go back
-            } else if let Some(idx) = options.iter().position(|o| o == &selected) {
-                if idx < results.len() {
-                    Ok(SessionMenuChoice::Select(results[idx].0.clone()))
-                } else {
-                    Ok(SessionMenuChoice::SwitchProject)
-                }
-            } else {
-                Ok(SessionMenuChoice::SwitchProject)
-            }
+    // SwitchProject is reused as "back to the session list" here: the search
+    // branch of the interactive loop falls through and re-renders it.
+    match NavSelect::new("Select a session:", options).prompt()? {
+        NavOutcome::Selected(idx) if idx < results.len() => {
+            Ok(SessionMenuChoice::Select(results[idx].0.clone()))
         }
-        Err(_) => Ok(SessionMenuChoice::SwitchProject),
+        NavOutcome::Selected(_) | NavOutcome::Back | NavOutcome::Cancel => {
+            Ok(SessionMenuChoice::SwitchProject)
+        }
     }
 }
 
@@ -2506,28 +2498,23 @@ fn show_action_menu(session: &SessionSummary) -> Result<ActionChoice> {
     } else {
         "Open in Claude"
     };
-    let labels: Vec<&str> = actions
+    let labels: Vec<String> = actions
         .iter()
-        .map(|action| match action {
-            ActionChoice::OpenInEditor => open_label,
-            ActionChoice::ViewDetails => "View details",
-            ActionChoice::Rename => "Rename session",
-            ActionChoice::Delete => "Delete session",
-            ActionChoice::Back => "Back to session list",
+        .map(|action| {
+            match action {
+                ActionChoice::OpenInEditor => open_label,
+                ActionChoice::ViewDetails => "View details",
+                ActionChoice::Rename => "Rename session",
+                ActionChoice::Delete => "Delete session",
+                ActionChoice::Back => "Back to session list",
+            }
+            .to_string()
         })
         .collect();
 
-    let selection = Select::new("Choose an action:", labels.clone())
-        .with_help_message("Use arrow keys to navigate, Enter to select")
-        .prompt();
-
-    match selection {
-        Ok(selected) => labels
-            .iter()
-            .position(|label| *label == selected)
-            .map(|index| actions[index])
-            .ok_or_else(|| anyhow::anyhow!("Unknown session action selected")),
-        Err(_) => Ok(ActionChoice::Back),
+    match NavSelect::new("Choose an action:", labels).prompt()? {
+        NavOutcome::Selected(idx) => Ok(actions[idx]),
+        NavOutcome::Back | NavOutcome::Cancel => Ok(ActionChoice::Back),
     }
 }
 
@@ -3053,6 +3040,41 @@ fn cleanup_sessions_interactive(project: &ProjectSummary) -> Result<usize> {
 // Main Entry Point
 // ============================================================================
 
+/// Run the action menu for one session until the user leaves it.
+///
+/// Returns `(exit_app, list_needs_refresh)`. Shared by the primary session-menu
+/// path and the search-results path, which previously carried diverging copies
+/// of this loop.
+fn run_action_menu_loop(session: &mut SessionSummary) -> Result<(bool, bool)> {
+    let mut refresh = false;
+    loop {
+        match show_action_menu(session)? {
+            ActionChoice::OpenInEditor => {
+                if open_in_editor(session)? {
+                    return Ok((true, refresh));
+                }
+                // Cancelled/empty command: stay in the action menu.
+            }
+            ActionChoice::ViewDetails => {
+                show_session_details(session)?;
+            }
+            ActionChoice::Rename => {
+                if rename_session_interactive(session)? {
+                    refresh = true;
+                }
+            }
+            ActionChoice::Delete => {
+                if delete_session_interactive(session)? {
+                    refresh = true;
+                    break;
+                }
+            }
+            ActionChoice::Back => break,
+        }
+    }
+    Ok((false, refresh))
+}
+
 /// Main interactive session management handler
 pub fn handle_session_interactive(
     project_filter: Option<&str>,
@@ -3149,32 +3171,9 @@ pub fn handle_session_interactive(
             )? {
                 SessionMenuChoice::Select(session) => {
                     let mut session = session;
-                    let mut list_needs_refresh = false;
-                    loop {
-                        match show_action_menu(&session)? {
-                            ActionChoice::OpenInEditor => {
-                                if open_in_editor(&session)? {
-                                    return Ok(());
-                                }
-                            }
-                            ActionChoice::ViewDetails => {
-                                show_session_details(&session)?;
-                            }
-                            ActionChoice::Rename => {
-                                if rename_session_interactive(&mut session)? {
-                                    list_needs_refresh = true;
-                                }
-                            }
-                            ActionChoice::Delete => {
-                                if delete_session_interactive(&session)? {
-                                    list_needs_refresh = true;
-                                    break;
-                                }
-                            }
-                            ActionChoice::Back => {
-                                break;
-                            }
-                        }
+                    let (exit_app, list_needs_refresh) = run_action_menu_loop(&mut session)?;
+                    if exit_app {
+                        return Ok(());
                     }
                     if list_needs_refresh {
                         all_sessions = scan_summaries_for_interactive(
@@ -3182,6 +3181,7 @@ pub fn handle_session_interactive(
                             source,
                             include_hidden,
                         )?;
+                        filtered_counts.remove(&project.name);
                     }
                 }
                 SessionMenuChoice::Search => {
@@ -3197,31 +3197,10 @@ pub fn handle_session_interactive(
                                 show_search_results(&results, &keyword)?
                             {
                                 let mut session = session;
-                                let mut list_needs_refresh = false;
-                                loop {
-                                    match show_action_menu(&session)? {
-                                        ActionChoice::OpenInEditor => {
-                                            open_in_editor(&session)?;
-                                            return Ok(());
-                                        }
-                                        ActionChoice::ViewDetails => {
-                                            show_session_details(&session)?;
-                                        }
-                                        ActionChoice::Rename => {
-                                            if rename_session_interactive(&mut session)? {
-                                                list_needs_refresh = true;
-                                            }
-                                        }
-                                        ActionChoice::Delete => {
-                                            if delete_session_interactive(&session)? {
-                                                list_needs_refresh = true;
-                                                break;
-                                            }
-                                        }
-                                        ActionChoice::Back => {
-                                            break;
-                                        }
-                                    }
+                                let (exit_app, list_needs_refresh) =
+                                    run_action_menu_loop(&mut session)?;
+                                if exit_app {
+                                    return Ok(());
                                 }
                                 if list_needs_refresh {
                                     all_sessions = scan_summaries_for_interactive(
@@ -8561,6 +8540,32 @@ mod tests {
             session_count: 1,
             last_activity: None,
         }
+    }
+
+    #[test]
+    fn session_menu_slot_maps_indices_to_semantic_slots() {
+        use SessionMenuSlot::*;
+        // 3 sessions, cleanup enabled: [Search, S0, S1, S2, Cleanup, Switch, Exit]
+        assert!(matches!(session_menu_slot(0, 3, true), Search));
+        assert!(matches!(session_menu_slot(1, 3, true), Session(0)));
+        assert!(matches!(session_menu_slot(3, 3, true), Session(2)));
+        assert!(matches!(session_menu_slot(4, 3, true), Cleanup));
+        assert!(matches!(session_menu_slot(5, 3, true), SwitchProject));
+        assert!(matches!(session_menu_slot(6, 3, true), Exit));
+        // cleanup disabled: [Search, S0, S1, S2, Switch, Exit]
+        assert!(matches!(session_menu_slot(4, 3, false), SwitchProject));
+        assert!(matches!(session_menu_slot(5, 3, false), Exit));
+        // Slot layout must stay in lockstep with build_session_menu_options.
+        let sessions = vec![make_test_summary("s1", "proj", SessionSource::Claude)];
+        let options = build_session_menu_options(&sessions, 0, true);
+        assert!(matches!(
+            session_menu_slot(options.len() - 1, sessions.len(), true),
+            Exit
+        ));
+        assert!(matches!(
+            session_menu_slot(options.len() - 2, sessions.len(), true),
+            SwitchProject
+        ));
     }
 
     #[test]

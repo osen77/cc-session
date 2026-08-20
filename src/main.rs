@@ -8,6 +8,7 @@ mod history;
 mod interactive_conflict;
 mod logger;
 mod merge;
+mod nav_select;
 mod omp;
 mod onboarding;
 mod parser;
