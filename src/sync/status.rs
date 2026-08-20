@@ -7,7 +7,7 @@ use crate::filter::FilterConfig;
 use crate::path_security::{validate_directory_root, validate_sync_projects_root};
 use crate::scm;
 
-use super::discovery::{claude_projects_dir, discover_sessions};
+use super::discovery::{claude_projects_dir, count_unique_sessions, discover_sessions};
 use super::state::SyncState;
 
 /// Show sync status
@@ -71,20 +71,21 @@ pub fn show_status(show_conflicts: bool, show_files: bool) -> Result<()> {
         );
     }
 
-    // Session counts
+    // Session counts. These are display-only, so use the streaming counter
+    // instead of fully parsing every conversation file.
     println!();
     println!("{}", "对话历史:".bold());
     validate_directory_root(&claude_dir)?;
-    let local_sessions = discover_sessions(&claude_dir, &filter)?;
-    println!("  本地: {} 个会话", local_sessions.len().to_string().cyan());
+    let local_session_count = count_unique_sessions(&claude_dir, &filter)?;
+    println!("  本地: {} 个会话", local_session_count.to_string().cyan());
 
     let remote_projects_dir = state.sync_repo_path.join(&filter.sync_subdirectory);
     if remote_projects_dir.exists() {
         validate_sync_projects_root(&state.sync_repo_path, &remote_projects_dir)?;
-        let remote_sessions = discover_sessions(&remote_projects_dir, &filter)?;
+        let remote_session_count = count_unique_sessions(&remote_projects_dir, &filter)?;
         println!(
             "  同步仓库: {} 个会话",
-            remote_sessions.len().to_string().cyan()
+            remote_session_count.to_string().cyan()
         );
     }
 
@@ -143,10 +144,11 @@ pub fn show_status(show_conflicts: bool, show_files: bool) -> Result<()> {
         }
     }
 
-    // Show files if requested
+    // Show files if requested; only this detail view needs the full parse.
     if show_files {
         println!();
         println!("{}", "本地会话文件:".bold());
+        let local_sessions = discover_sessions(&claude_dir, &filter)?;
         for session in local_sessions.iter().take(20) {
             let relative = Path::new(&session.file_path)
                 .strip_prefix(&claude_dir)

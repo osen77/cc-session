@@ -192,6 +192,18 @@ pub(crate) enum MissingAction {
 
 /// Decide the action for locally-missing sessions.
 /// Explicit `--prune` always wins over the window (and keeps the plain wording).
+/// Skip rewriting a session only when identical content is already at the exact
+/// destination path. An Unchanged session discovered under a different layout
+/// (e.g. after a sync-mode switch) must still be written, or the current-mode
+/// destination would never be created.
+fn should_write_session(
+    operation: SyncOperation,
+    existing_path: Option<&Path>,
+    dest_path: &Path,
+) -> bool {
+    operation != SyncOperation::Unchanged || existing_path != Some(dest_path)
+}
+
 pub(crate) fn decide_missing_action(prune: bool, unlock_remaining: Option<u64>) -> MissingAction {
     if prune {
         MissingAction::PruneManual
@@ -660,6 +672,18 @@ pub fn push_history(
         .map(|s| (s.session_id.clone(), s))
         .collect();
 
+    // content_hash re-serializes every entry; computed serially inside the copy
+    // loop it dominated push time, so precompute both sides in parallel.
+    use rayon::prelude::*;
+    let local_hashes: HashMap<String, String> = sessions
+        .par_iter()
+        .map(|s| (s.session_id.clone(), s.content_hash()))
+        .collect();
+    let existing_hashes: HashMap<String, String> = existing_sessions
+        .par_iter()
+        .map(|s| (s.session_id.clone(), s.content_hash()))
+        .collect();
+
     // Track pushed conversations for operation record
     let mut pushed_conversations: Vec<ConversationSummary> = Vec::new();
     let mut added_count = 0;
@@ -716,8 +740,9 @@ pub fn push_history(
         let dest_path = safe_join_within_root(&projects_dir, &relative_path)?;
 
         // Determine operation type based on existing state
-        let operation = if let Some(existing) = existing_map.get(&session.session_id) {
-            if existing.content_hash() == session.content_hash() {
+        let existing = existing_map.get(&session.session_id);
+        let operation = if existing.is_some() {
+            if existing_hashes.get(&session.session_id) == local_hashes.get(&session.session_id) {
                 unchanged_count += 1;
                 SyncOperation::Unchanged
             } else {
@@ -729,8 +754,14 @@ pub fn push_history(
             SyncOperation::Added
         };
 
-        // Write the session file
-        session.write_to_file(&dest_path)?;
+        // Write the session file unless identical content is already there
+        if should_write_session(
+            operation,
+            existing.map(|s| Path::new(s.file_path.as_str())),
+            &dest_path,
+        ) {
+            session.write_to_file(&dest_path)?;
+        }
 
         // Track this session in pushed conversations
         let relative_path_str = relative_path.to_string_lossy().to_string();
@@ -773,8 +804,9 @@ pub fn push_history(
                 continue;
             };
 
-            let status = if let Some(existing) = existing_map.get(&session.session_id) {
-                if existing.content_hash() == session.content_hash() {
+            let status = if existing_map.contains_key(&session.session_id) {
+                if existing_hashes.get(&session.session_id) == local_hashes.get(&session.session_id)
+                {
                     "unchanged".dimmed()
                 } else {
                     "modified".yellow()
@@ -1257,6 +1289,31 @@ pub fn push_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_session_at_same_path_skips_rewrite() {
+        let dest = Path::new("/repo/projects/myproj/s1.jsonl");
+
+        // Identical content already at the destination: nothing to write.
+        assert!(!should_write_session(
+            SyncOperation::Unchanged,
+            Some(dest),
+            dest
+        ));
+        // Unchanged but found at a different layout path: still write, or the
+        // current-mode destination would never be created.
+        assert!(should_write_session(
+            SyncOperation::Unchanged,
+            Some(Path::new("/repo/projects/-Users-abc-myproj/s1.jsonl")),
+            dest
+        ));
+        assert!(should_write_session(SyncOperation::Added, None, dest));
+        assert!(should_write_session(
+            SyncOperation::Modified,
+            Some(dest),
+            dest
+        ));
+    }
 
     #[test]
     fn test_is_degraded_result_not_error() {

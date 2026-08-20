@@ -525,6 +525,8 @@ ccs unlock-delete --off           # 提前关闭
 4. **性能考虑**
    - 大量对话文件时避免重复解析
    - 使用增量同步而非全量复制
+   - 计数/展示类需求禁止走 `discover_sessions` 全量解析，用 `count_unique_sessions` / `parser::first_entry_value` 流式早退（2026-08-21）
+   - `discover_sessions` 已 rayon 并行；push 的 `content_hash` 必须保持循环外并行预计算，Unchanged 且路径一致的会话跳过重写（`should_write_session`）
 
 5. **测试隔离（重要）**
    - ❌ **禁止**在测试中直接读写真实配置目录（`~/Library/Application Support/claude-code-sync/`）

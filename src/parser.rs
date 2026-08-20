@@ -306,11 +306,7 @@ impl ConversationSession {
         self.entries
             .iter()
             .find_map(|e| e.cwd.as_ref())
-            .and_then(|cwd| {
-                // Split by both / and \ to handle cross-platform paths
-                // Take the last non-empty component
-                cwd.split(&['/', '\\']).rfind(|s| !s.is_empty())
-            })
+            .and_then(|cwd| project_name_from_cwd(cwd))
     }
 
     /// Get the full cwd path from the first entry that has it
@@ -632,6 +628,40 @@ impl ConversationSession {
     }
 }
 
+/// Extract the project name (last non-empty path component) from a `cwd` value,
+/// handling both Unix and Windows separators for cross-platform sync.
+pub(crate) fn project_name_from_cwd(cwd: &str) -> Option<&str> {
+    cwd.split(&['/', '\\']).rfind(|s| !s.is_empty())
+}
+
+/// Stream a JSONL file and return the first value `pick` extracts from an entry.
+///
+/// Stops reading at the first hit, so callers needing a single field (session ID,
+/// cwd) pay only for the bytes up to it instead of a full parse. Malformed lines
+/// are skipped like `from_file`; a read error before a hit is returned so callers
+/// can skip the file the same way discovery skips unparseable files.
+pub(crate) fn first_entry_value<T>(
+    path: &Path,
+    mut pick: impl FnMut(&ConversationEntry) -> Option<T>,
+) -> Result<Option<T>> {
+    let file =
+        File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
+    for (line_num, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.with_context(|| {
+            format!("Failed to read line {} in {}", line_num + 1, path.display())
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<ConversationEntry>(&line) {
+            if let Some(value) = pick(&entry) {
+                return Ok(Some(value));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Extract file basename hint from a tool_use block's input.file_path.
 fn extract_file_hint(block: &Value) -> Option<&str> {
     block
@@ -739,6 +769,43 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn first_entry_value_stops_reading_at_first_hit() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","sessionId":"early-exit","timestamp":"2026-08-21T00:00:00Z"}}"#
+        )
+        .unwrap();
+        // Invalid UTF-8 after the hit: a full parse would fail here, so a
+        // successful result proves reading stopped at the first line.
+        file.write_all(&[0xFF, 0xFE, 0xFD, b'\n']).unwrap();
+        file.flush().unwrap();
+
+        assert!(ConversationSession::from_file(file.path()).is_err());
+        let found = first_entry_value(file.path(), |entry| entry.session_id.clone()).unwrap();
+        assert_eq!(found.as_deref(), Some("early-exit"));
+    }
+
+    #[test]
+    fn first_entry_value_skips_malformed_and_non_matching_lines() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "not json at all").unwrap();
+        writeln!(file, r#"{{"type":"file-history-snapshot"}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","sessionId":"third-line","timestamp":"2026-08-21T00:00:00Z"}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let found = first_entry_value(file.path(), |entry| entry.session_id.clone()).unwrap();
+        assert_eq!(found.as_deref(), Some("third-line"));
+
+        let miss = first_entry_value(file.path(), |entry| entry.cwd.clone()).unwrap();
+        assert_eq!(miss, None);
+    }
 
     #[test]
     fn reader_io_error_is_returned_with_original_error_kind() {

@@ -31,30 +31,22 @@ pub(crate) fn discover_sessions(
     base_path: &Path,
     filter: &FilterConfig,
 ) -> Result<Vec<ConversationSession>> {
-    let mut sessions = Vec::new();
+    let candidates = collect_session_candidates(base_path, filter);
 
-    for entry in WalkDir::new(base_path).follow_links(false).into_iter() {
-        let Some(entry) = legacy_walk_entry(entry, "claude") else {
-            continue;
-        };
-        let path = entry.path();
-
-        if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-            if !filter.should_include(path) {
-                continue;
+    // Parsing dominates the cost and each file is independent; parse in parallel.
+    // par_iter + collect preserves candidate order, so dedup tie-breaking below
+    // behaves exactly as the previous serial loop.
+    use rayon::prelude::*;
+    let sessions: Vec<ConversationSession> = candidates
+        .par_iter()
+        .filter_map(|path| match ConversationSession::from_file(path) {
+            Ok(session) => Some(session),
+            Err(_) => {
+                log::warn!(target: crate::logger::SCAN_DIAGNOSTICS_TARGET, "legacy Claude session discovery skipped an unparseable file");
+                None
             }
-            if validate_regular_candidate(base_path, path).is_err() {
-                continue;
-            }
-
-            match ConversationSession::from_file(path) {
-                Ok(session) => sessions.push(session),
-                Err(_) => {
-                    log::warn!(target: crate::logger::SCAN_DIAGNOSTICS_TARGET, "legacy Claude session discovery skipped an unparseable file");
-                }
-            }
-        }
-    }
+        })
+        .collect();
 
     // Deduplicate by session_id, keeping the session with the most messages.
     // This handles cases where agent subprocess files share the same session_id
@@ -86,6 +78,57 @@ pub(crate) fn discover_sessions(
     }
 
     Ok(session_map.into_values().collect())
+}
+
+/// Walk `base_path` and return the validated `.jsonl` candidates, applying the
+/// same filter and path-security checks as `discover_sessions`.
+fn collect_session_candidates(base_path: &Path, filter: &FilterConfig) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for entry in WalkDir::new(base_path).follow_links(false).into_iter() {
+        let Some(entry) = legacy_walk_entry(entry, "claude") else {
+            continue;
+        };
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if !filter.should_include(path) {
+            continue;
+        }
+        if validate_regular_candidate(base_path, path).is_err() {
+            continue;
+        }
+        candidates.push(path.to_path_buf());
+    }
+    candidates
+}
+
+/// Count distinct sessions without fully parsing each file.
+///
+/// Mirrors `discover_sessions`' walk, filter and dedup semantics, but reads each
+/// file only until its session ID is found (usually the first line), falling back
+/// to the filename stem like the full parser does. Files that error before a
+/// session ID is found are skipped, matching discovery's skip of unparseable
+/// files. Intended for display counts (`ccs status`); sync flows that need the
+/// session content must keep using `discover_sessions`.
+pub(crate) fn count_unique_sessions(base_path: &Path, filter: &FilterConfig) -> Result<usize> {
+    let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for path in collect_session_candidates(base_path, filter) {
+        match crate::parser::first_entry_value(&path, |entry| entry.session_id.clone()) {
+            Ok(Some(id)) => {
+                ids.insert(id);
+            }
+            Ok(None) => {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    ids.insert(stem.to_string());
+                }
+            }
+            Err(_) => {
+                log::warn!(target: crate::logger::SCAN_DIAGNOSTICS_TARGET, "session count skipped an unreadable file");
+            }
+        }
+    }
+    Ok(ids.len())
 }
 
 /// Check for large conversation files and emit warnings
@@ -243,10 +286,16 @@ fn get_project_name_from_dir(dir_path: &Path) -> Option<String> {
         if validate_regular_candidate(dir_path, &file_path).is_err() {
             continue;
         }
-        if let Ok(session) = crate::parser::ConversationSession::from_file(&file_path) {
-            if let Some(real_name) = session.project_name() {
-                return Some(real_name.to_string());
-            }
+        // Stream only until the first cwd: these files can be hundreds of MB and
+        // a full parse here just to read one field dominated push startup.
+        if let Ok(Some(name)) = crate::parser::first_entry_value(&file_path, |entry| {
+            entry
+                .cwd
+                .as_deref()
+                .and_then(crate::parser::project_name_from_cwd)
+                .map(str::to_string)
+        }) {
+            return Some(name);
         }
     }
     None
@@ -524,6 +573,49 @@ mod tests {
         assert_eq!(collisions.len(), 1);
         assert!(collisions.contains_key("myapp"));
         assert_eq!(collisions.get("myapp").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn count_unique_sessions_dedups_ids_and_falls_back_to_filename() {
+        let temp_dir = tempdir().unwrap();
+        let projects_dir = temp_dir.path();
+
+        let sub = projects_dir.join("proj");
+        fs::create_dir(&sub).unwrap();
+        for name in ["main.jsonl", "agent.jsonl"] {
+            let mut file = fs::File::create(sub.join(name)).unwrap();
+            writeln!(
+                file,
+                r#"{{"type":"user","sessionId":"shared-id","timestamp":"2026-08-21T00:00:00Z"}}"#
+            )
+            .unwrap();
+        }
+        // No sessionId anywhere: counted once under its filename stem.
+        let mut file = fs::File::create(sub.join("snapshot-only.jsonl")).unwrap();
+        writeln!(file, r#"{{"type":"file-history-snapshot"}}"#).unwrap();
+        // Non-jsonl files are ignored.
+        fs::write(sub.join("notes.txt"), "ignored").unwrap();
+
+        let filter = crate::filter::FilterConfig::default();
+        assert_eq!(count_unique_sessions(projects_dir, &filter).unwrap(), 2);
+    }
+
+    #[test]
+    fn get_project_name_from_dir_stops_reading_after_cwd() {
+        let temp_dir = tempdir().unwrap();
+        let dir = temp_dir.path().join("-Users-abc-myproj");
+        fs::create_dir(&dir).unwrap();
+
+        let mut file = fs::File::create(dir.join("session.jsonl")).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","sessionId":"s1","cwd":"/Users/abc/myproj","timestamp":"2026-08-21T00:00:00Z"}}"#
+        )
+        .unwrap();
+        // Corruption after the cwd line must not prevent name extraction.
+        file.write_all(&[0xFF, 0xFE, 0xFD, b'\n']).unwrap();
+
+        assert_eq!(get_project_name_from_dir(&dir).as_deref(), Some("myproj"));
     }
 
     #[test]
