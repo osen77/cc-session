@@ -17,7 +17,7 @@ use crate::path_security::{
     safe_join_within_root, safe_relative_path_within_root, validate_directory_root,
     validate_regular_candidate,
 };
-use crate::session_cache::fingerprint_file;
+use crate::session_cache::{fingerprint_file, FileFingerprint};
 use crate::session_model::{SessionIdentity, SessionSource, SessionSourceFilter, SessionSummary};
 
 use self::classifier::{classify, ClassifierPolicy, MaintenanceCandidate};
@@ -59,6 +59,10 @@ pub(crate) struct MaintenanceInput<'a> {
     pub config_dir: &'a Path,
     pub settings: &'a SessionMaintenanceSettings,
     pub clock: &'a dyn MaintenanceClock,
+    /// Content fingerprints the scanner already measured (or cache-trusted) this
+    /// run, keyed by session file path. Candidates reuse them instead of re-reading
+    /// every file; recycle transactions still re-verify at action time.
+    pub scan_fingerprints: &'a HashMap<PathBuf, String>,
 }
 
 /// Aggregate result of one maintenance run.
@@ -82,16 +86,27 @@ pub(crate) struct VisibilityIndex {
 }
 
 /// Construct a classifier candidate from a validated scanner summary.
+///
+/// `scan_fingerprint` is the digest the scanner measured (or cache-trusted) for this
+/// summary's file in the same run; passing it skips a second full read. Without it,
+/// the file is fingerprinted here.
 pub(crate) fn candidate_from_summary(
     summary: &SessionSummary,
     roots: &MaintenanceRoots,
     existing: Option<&MaintenanceEntry>,
+    scan_fingerprint: Option<&str>,
 ) -> Result<MaintenanceCandidate> {
     let identity = summary.identity()?;
     let source_root = roots.source_root(identity.source);
     let original_relative_path = safe_relative_path_within_root(source_root, &summary.file_path)
         .context("session file is not a safe source candidate")?;
-    let fingerprint = fingerprint_file(&summary.file_path)?;
+    let fingerprint = match scan_fingerprint {
+        Some(digest) => FileFingerprint {
+            digest: digest.to_string(),
+            bytes: summary.file_size,
+        },
+        None => fingerprint_file(&summary.file_path)?,
+    };
     let source_label = identity.source.as_str().to_string();
     let parse_timestamp = |value: &Option<String>| -> Result<Option<DateTime<Utc>>> {
         value
@@ -341,7 +356,15 @@ pub(crate) fn run_maintenance(
         let summary = summaries[0];
         let key = identity_key(&identity);
         let existing = state.entries.get(&key);
-        match candidate_from_summary(summary, input.roots, existing) {
+        match candidate_from_summary(
+            summary,
+            input.roots,
+            existing,
+            input
+                .scan_fingerprints
+                .get(&summary.file_path)
+                .map(String::as_str),
+        ) {
             Ok(candidate) => candidates.push((candidate, existing.cloned())),
             Err(_) => validation_failed = true,
         }
@@ -780,6 +803,7 @@ mod tests {
                     config_dir: &self.config_dir,
                     settings: Box::leak(Box::new(settings)),
                     clock: Box::leak(Box::new(FixedClock(self.now))),
+                    scan_fingerprints: Box::leak(Box::new(HashMap::new())),
                 },
                 mode,
             )
@@ -1157,6 +1181,7 @@ mod tests {
                 config_dir: &fixture.config_dir,
                 settings: &SessionMaintenanceSettings::default(),
                 clock: &FixedClock(fixture.now),
+                scan_fingerprints: &HashMap::new(),
             },
             MaintenanceMode::Disabled,
         )
@@ -1184,6 +1209,7 @@ mod tests {
                 config_dir: &fixture.config_dir,
                 settings: Box::leak(Box::new(SessionMaintenanceSettings::default())),
                 clock: Box::leak(Box::new(FixedClock(fixture.now))),
+                scan_fingerprints: Box::leak(Box::new(HashMap::new())),
             },
             MaintenanceMode::Apply,
         )

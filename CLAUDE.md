@@ -169,6 +169,7 @@ Codex/OMP 的普通 rename/delete 仍为只读；本地维护只移动和恢复�
 - 分类器信号中，`TemporaryCwd` 与 `FixtureTemporaryCwd` 必须读 `MaintenanceCandidate::cwd`（真实工作目录），**禁止**读 `project_dir`——Claude 的 `project_dir` 是 `~/.claude/projects/<encoded>` 编码目录，与 Codex/OMP 的语义不同。
 - `RepeatedTitleBurst` 是唯一的跨会话信号：同一逐字标题在 60 分钟内出现 ≥3 次才计分，由 `repeated_title_bursts()` 在候选集装配完成后一次性预扫描，classifier 本身保持纯函数。窗口用于区分手工连跑与定时任务；提示词内嵌每次不同内容的定时任务天然不成组。
 - Session index cache 当前为 v5，新增 `cwd`，旧 v4 必须失效重建，否则临时目录判定会因命中旧 entry 而静默跳过。
+- **指纹信任窗口（性能关键，2026-08-21）**：mtime 早于 `FINGERPRINT_TRUST_WINDOW_SECS`（24h）且缓存 size+mtime 匹配的文件直接复用缓存指纹，不再读全文（`trusted_fingerprint`）；维护流程经 `MaintenanceInput::scan_fingerprints` 复用扫描指纹，禁止再独立全量 `fingerprint_file`。改动这两处前先读 `local/notes.md` 2026-08-21 条目的安全论证；回收动作的动作时指纹校验是最终防线，不得移除。
 
 ### 6. 自动同步 (`handlers/automate.rs`, `hooks.rs`, `wrapper.rs`)
 

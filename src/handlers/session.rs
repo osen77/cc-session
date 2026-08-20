@@ -33,8 +33,8 @@ use crate::path_security::{
 };
 use crate::scm;
 use crate::session_cache::{
-    fingerprint_file, merge_scan_with_report, CacheDelta, CacheFileState, CacheRemoval,
-    CacheRetention, CacheUpsert, CachedEntry, SessionIndexCache,
+    fingerprint_file, fingerprint_trust_cutoff_secs, merge_scan_with_report, CacheDelta,
+    CacheFileState, CacheRemoval, CacheRetention, CacheUpsert, CachedEntry, SessionIndexCache,
 };
 use crate::session_diagnostics::{
     error_kind_from_error, legacy_io_warning, legacy_io_warning_from_error, ScanDiagnostics,
@@ -534,6 +534,7 @@ fn maintenance_visibility_for_scan(
     roots: &SessionRoots,
     config_dir: &Path,
     scan_mode: MaintenanceScanMode,
+    scan_fingerprints: &HashMap<PathBuf, String>,
 ) -> Result<crate::session_maintenance::MaintenanceReport> {
     let config = maintenance_settings_from_config_dir(config_dir);
     let maintenance_roots = MaintenanceRoots {
@@ -560,6 +561,7 @@ fn maintenance_visibility_for_scan(
             config_dir,
             settings: &config.session_maintenance,
             clock: &clock,
+            scan_fingerprints,
         },
         mode,
     )
@@ -824,6 +826,9 @@ fn scan_all_session_summaries_with_roots_mode(
     let mut delta = CacheDelta::default();
     let mut tracker = SourceScanTracker::default();
     let mut summaries = Vec::new();
+    // Content fingerprints measured (or cache-trusted) during this scan, so the
+    // maintenance pass can classify candidates without re-reading every file.
+    let mut scan_fingerprints: HashMap<PathBuf, String> = HashMap::new();
 
     if source.includes_claude() {
         tracker.begin("claude");
@@ -835,6 +840,7 @@ fn scan_all_session_summaries_with_roots_mode(
             &mut tracker,
             &mut summaries,
             &mut diagnostics,
+            &mut scan_fingerprints,
             project_filter,
         )?;
         diagnostics.claude_scan_ms = elapsed_millis(scan_started);
@@ -850,6 +856,7 @@ fn scan_all_session_summaries_with_roots_mode(
             &mut tracker,
             &mut summaries,
             &mut diagnostics,
+            &mut scan_fingerprints,
             project_filter,
         )?;
         diagnostics.codex_scan_ms = elapsed_millis(scan_started);
@@ -864,6 +871,7 @@ fn scan_all_session_summaries_with_roots_mode(
             &mut tracker,
             &mut summaries,
             &mut diagnostics,
+            &mut scan_fingerprints,
             project_filter,
         )?;
         diagnostics.omp_scan_ms = elapsed_millis(scan_started);
@@ -921,6 +929,7 @@ fn scan_all_session_summaries_with_roots_mode(
         roots,
         config_dir,
         maintenance_mode,
+        &scan_fingerprints,
     )?;
     let visibility = maintenance_report.visibility.clone();
     diagnostics.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -982,6 +991,7 @@ fn inspect_candidate_file(
     file_path: &Path,
     filter: &FilterConfig,
     source: &str,
+    cache: &SessionIndexCache,
     tracker: &mut SourceScanTracker,
     diagnostics: &mut ScanDiagnostics,
 ) -> Option<CandidateFile> {
@@ -1086,6 +1096,24 @@ fn inspect_candidate_file(
         .metadata_ms
         .saturating_add(elapsed_millis(metadata_started));
 
+    let path_key = canonical_utf8_key(file_path);
+
+    // Old files whose size+mtime still match the cache reuse the stored fingerprint
+    // without re-reading the file; see FINGERPRINT_TRUST_WINDOW_SECS for the rationale.
+    if mtime_secs < fingerprint_trust_cutoff_secs() {
+        if let Some(fingerprint) = path_key
+            .as_deref()
+            .and_then(|key| cache.trusted_fingerprint(key, metadata.len(), mtime_secs))
+        {
+            return Some(CandidateFile {
+                content_fingerprint: fingerprint.to_string(),
+                path_key,
+                file_size: metadata.len(),
+                mtime_secs,
+            });
+        }
+    }
+
     let fingerprint_started = Instant::now();
     let fingerprint = match fingerprint_file(file_path) {
         Ok(fingerprint) => fingerprint,
@@ -1112,7 +1140,7 @@ fn inspect_candidate_file(
         .saturating_add(fingerprint.bytes);
 
     Some(CandidateFile {
-        path_key: canonical_utf8_key(file_path),
+        path_key,
         file_size: metadata.len(),
         mtime_secs,
         content_fingerprint: fingerprint.digest,
@@ -1252,6 +1280,7 @@ fn handle_parser_error(
 }
 
 /// Scan Claude Code sessions with index cache and diagnostics.
+#[allow(clippy::too_many_arguments)]
 fn scan_claude_summaries_cached(
     root: &Path,
     cache: &SessionIndexCache,
@@ -1259,6 +1288,7 @@ fn scan_claude_summaries_cached(
     tracker: &mut SourceScanTracker,
     summaries: &mut Vec<SessionSummary>,
     diagnostics: &mut ScanDiagnostics,
+    scan_fingerprints: &mut HashMap<PathBuf, String>,
     project_filter: Option<&str>,
 ) -> Result<()> {
     use walkdir::WalkDir;
@@ -1339,11 +1369,21 @@ fn scan_claude_summaries_cached(
                 continue;
             };
             let file_path = entry.path();
-            let Some(candidate) =
-                inspect_candidate_file(root, file_path, &filter, "claude", tracker, diagnostics)
-            else {
+            let Some(candidate) = inspect_candidate_file(
+                root,
+                file_path,
+                &filter,
+                "claude",
+                cache,
+                tracker,
+                diagnostics,
+            ) else {
                 continue;
             };
+            scan_fingerprints.insert(
+                file_path.to_path_buf(),
+                candidate.content_fingerprint.clone(),
+            );
             if let Some(path_key) = candidate.path_key.as_ref() {
                 tracker.seen("claude", path_key.clone());
                 if let Some(summary) = cache.lookup_with_fingerprint(
@@ -1472,6 +1512,7 @@ fn scan_codex_summaries_cached(
     tracker: &mut SourceScanTracker,
     summaries: &mut Vec<SessionSummary>,
     diagnostics: &mut ScanDiagnostics,
+    scan_fingerprints: &mut HashMap<PathBuf, String>,
     project_filter: Option<&str>,
 ) -> Result<()> {
     use walkdir::WalkDir;
@@ -1508,11 +1549,16 @@ fn scan_codex_summaries_cached(
             file_path,
             &filter,
             "codex",
+            cache,
             tracker,
             diagnostics,
         ) else {
             continue;
         };
+        scan_fingerprints.insert(
+            file_path.to_path_buf(),
+            candidate.content_fingerprint.clone(),
+        );
         if let Some(path_key) = candidate.path_key.as_ref() {
             tracker.seen("codex", path_key.clone());
             if let Some(summary) = cache.lookup_with_fingerprint(
@@ -1600,6 +1646,7 @@ fn scan_codex_summaries_cached(
 }
 
 /// Scan OMP sessions with index cache and diagnostics.
+#[allow(clippy::too_many_arguments)]
 fn scan_omp_summaries_cached(
     root: &Path,
     cache: &SessionIndexCache,
@@ -1607,6 +1654,7 @@ fn scan_omp_summaries_cached(
     tracker: &mut SourceScanTracker,
     summaries: &mut Vec<SessionSummary>,
     diagnostics: &mut ScanDiagnostics,
+    scan_fingerprints: &mut HashMap<PathBuf, String>,
     project_filter: Option<&str>,
 ) -> Result<()> {
     use walkdir::WalkDir;
@@ -1626,10 +1674,14 @@ fn scan_omp_summaries_cached(
         };
         let file_path = entry.path();
         let Some(candidate) =
-            inspect_candidate_file(root, file_path, &filter, "omp", tracker, diagnostics)
+            inspect_candidate_file(root, file_path, &filter, "omp", cache, tracker, diagnostics)
         else {
             continue;
         };
+        scan_fingerprints.insert(
+            file_path.to_path_buf(),
+            candidate.content_fingerprint.clone(),
+        );
         let cached_summary = candidate.path_key.as_ref().and_then(|path_key| {
             tracker.seen("omp", path_key.clone());
             let summary = cache.lookup_with_fingerprint(
@@ -5197,7 +5249,7 @@ fn entry_from_summary(
     keep: bool,
     explicit_test: bool,
 ) -> Result<MaintenanceEntry> {
-    let candidate = candidate_from_summary(summary, roots, None)?;
+    let candidate = candidate_from_summary(summary, roots, None, None)?;
     Ok(MaintenanceEntry {
         identity: candidate.identity,
         original_relative_path: candidate.original_relative_path,
@@ -6581,6 +6633,7 @@ mod tests {
             &missing,
             &FilterConfig::no_size_limit(),
             "claude",
+            &SessionIndexCache::empty(),
             &mut tracker,
             &mut diagnostics,
         )
@@ -6604,6 +6657,7 @@ mod tests {
             &path,
             &FilterConfig::no_size_limit(),
             "claude",
+            &SessionIndexCache::empty(),
             &mut tracker,
             &mut diagnostics,
         );
@@ -6632,6 +6686,7 @@ mod tests {
             &directory,
             &FilterConfig::no_size_limit(),
             "claude",
+            &SessionIndexCache::empty(),
             &mut tracker,
             &mut diagnostics,
         )
@@ -7974,6 +8029,7 @@ mod tests {
             &missing,
             &FilterConfig::no_size_limit(),
             "claude",
+            &SessionIndexCache::empty(),
             &mut tracker,
             &mut diagnostics,
         )
@@ -8482,6 +8538,158 @@ mod tests {
         assert_eq!(second.diagnostics.cache_misses, 1);
         assert!(second.diagnostics.degraded());
         assert!(SessionIndexCache::load(&config).entries.is_empty());
+    }
+
+    /// Age a file's mtime past the fingerprint trust window while keeping content.
+    fn set_mtime_days_ago(path: &Path, days: u64) {
+        let old =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(days * 24 * 60 * 60);
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+    }
+
+    #[test]
+    fn scanner_trusts_metadata_for_old_files_without_reading_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("claude/project");
+        fs::create_dir_all(&project).unwrap();
+        let session_file = project.join("session.jsonl");
+        fs::write(
+            &session_file,
+            concat!(
+                r#"{"type":"user","sessionId":"cc-trusted","cwd":"/tmp/demo","timestamp":"2026-08-02T00:00:00Z","message":{"role":"user","content":"hello"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        set_mtime_days_ago(&session_file, 20);
+
+        let roots = SessionRoots {
+            claude_projects: temp.path().join("claude"),
+            codex_sessions: temp.path().join("missing-codex"),
+            codex_history: temp.path().join("missing-history.jsonl"),
+            omp_sessions: temp.path().join("missing-omp"),
+        };
+        let config = temp.path().join("config");
+        let first = scan_all_session_summaries_with_roots(
+            None,
+            SessionSourceFilter::Claude,
+            &roots,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(first.summaries.len(), 1);
+        assert_eq!(first.diagnostics.cache_misses, 1);
+
+        // Any attempt to read the file for fingerprinting now fails loudly.
+        crate::session_cache::set_test_fingerprint_error_path(Some(session_file.clone()));
+        let second = scan_all_session_summaries_with_roots(
+            None,
+            SessionSourceFilter::Claude,
+            &roots,
+            &config,
+        );
+        crate::session_cache::set_test_fingerprint_error_path(None);
+        let second = second.unwrap();
+
+        assert_eq!(second.summaries.len(), 1);
+        assert_eq!(second.diagnostics.cache_hits, 1);
+        assert_eq!(second.diagnostics.fingerprinted_bytes, 0);
+        assert!(!second.diagnostics.degraded());
+        // Maintenance runs in Apply mode here and must reuse the scan's fingerprints
+        // instead of re-reading the file (the armed error hook would trip it).
+        assert_eq!(second.maintenance_report.warnings, 0);
+        assert_eq!(second.maintenance_report.candidates, 1);
+    }
+
+    #[test]
+    fn scanner_still_detects_changes_to_old_files_when_metadata_differs() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("claude/project");
+        fs::create_dir_all(&project).unwrap();
+        let session_file = project.join("session.jsonl");
+        fs::write(
+            &session_file,
+            concat!(
+                r#"{"type":"user","sessionId":"cc-old-edit","cwd":"/tmp/demo","timestamp":"2026-08-02T00:00:00Z","message":{"role":"user","content":"hello"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        set_mtime_days_ago(&session_file, 20);
+
+        let roots = SessionRoots {
+            claude_projects: temp.path().join("claude"),
+            codex_sessions: temp.path().join("missing-codex"),
+            codex_history: temp.path().join("missing-history.jsonl"),
+            omp_sessions: temp.path().join("missing-omp"),
+        };
+        let config = temp.path().join("config");
+        scan_all_session_summaries_with_roots(None, SessionSourceFilter::Claude, &roots, &config)
+            .unwrap();
+
+        // Grow the file (size changes) but keep the mtime outside the trust window.
+        fs::write(
+            &session_file,
+            concat!(
+                r#"{"type":"user","sessionId":"cc-old-edit","cwd":"/tmp/demo","timestamp":"2026-08-02T00:00:00Z","message":{"role":"user","content":"hello"}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"cc-old-edit","cwd":"/tmp/demo","timestamp":"2026-08-03T00:00:00Z","message":{"role":"user","content":"more"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        set_mtime_days_ago(&session_file, 20);
+
+        let second = scan_all_session_summaries_with_roots(
+            None,
+            SessionSourceFilter::Claude,
+            &roots,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(second.diagnostics.cache_hits, 0);
+        assert_eq!(second.diagnostics.cache_misses, 1);
+        assert_eq!(second.diagnostics.files_parsed, 1);
+        assert_eq!(second.summaries.len(), 1);
+        assert_eq!(second.summaries[0].message_count, 2);
+    }
+
+    #[test]
+    fn scanner_keeps_fingerprinting_recently_modified_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("claude/project");
+        fs::create_dir_all(&project).unwrap();
+        let session_file = project.join("session.jsonl");
+        fs::write(
+            &session_file,
+            concat!(
+                r#"{"type":"user","sessionId":"cc-recent","cwd":"/tmp/demo","timestamp":"2026-08-02T00:00:00Z","message":{"role":"user","content":"hello"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let roots = SessionRoots {
+            claude_projects: temp.path().join("claude"),
+            codex_sessions: temp.path().join("missing-codex"),
+            codex_history: temp.path().join("missing-history.jsonl"),
+            omp_sessions: temp.path().join("missing-omp"),
+        };
+        let config = temp.path().join("config");
+        scan_all_session_summaries_with_roots(None, SessionSourceFilter::Claude, &roots, &config)
+            .unwrap();
+
+        let second = scan_all_session_summaries_with_roots(
+            None,
+            SessionSourceFilter::Claude,
+            &roots,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(second.diagnostics.cache_hits, 1);
+        assert!(second.diagnostics.fingerprinted_bytes > 0);
     }
 
     #[cfg(unix)]

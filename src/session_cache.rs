@@ -31,6 +31,28 @@ pub struct FileFingerprint {
     pub bytes: u64,
 }
 
+/// Files whose mtime is older than this window may skip content fingerprinting when
+/// their size and mtime still match the cached entry. The fingerprint exists to catch
+/// rewrites that preserve size and second-level mtime, which can only race a file that
+/// is being actively written — and an actively written file has a recent mtime, so it
+/// stays on the fingerprint path. A cached entry's fingerprint was computed when the
+/// file was last modified, so trusting it later only forgoes detection of content
+/// tampering that also forges an old mtime — outside the threat model this cache
+/// defends against. 24h leaves ample margin over mtime granularity and clock skew.
+pub const FINGERPRINT_TRUST_WINDOW_SECS: i64 = 24 * 60 * 60;
+
+/// Oldest mtime (Unix seconds) still required to fingerprint. If the clock is
+/// unavailable, returns `i64::MIN` so every file keeps fingerprinting (fail-safe).
+pub fn fingerprint_trust_cutoff_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|now| i64::try_from(now.as_secs()).ok())
+        .map_or(i64::MIN, |secs| {
+            secs.saturating_sub(FINGERPRINT_TRUST_WINDOW_SECS)
+        })
+}
+
 /// Stream a file through BLAKE3 without loading its complete contents in memory.
 pub fn fingerprint_file(path: &Path) -> Result<FileFingerprint> {
     #[cfg(test)]
@@ -239,7 +261,7 @@ impl CachedEntry {
 
 impl SessionIndexCache {
     /// Create an empty cache with the current version.
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         SessionIndexCache {
             version: CACHE_VERSION,
             entries: HashMap::new(),
@@ -371,6 +393,20 @@ impl SessionIndexCache {
             file_size,
             has_custom_title: entry.has_custom_title,
         })
+    }
+
+    /// Return the stored fingerprint when `file_size` and `mtime_secs` match the
+    /// cached entry exactly and the entry carries a real (non-legacy) fingerprint.
+    /// Callers must only use this for files outside [`FINGERPRINT_TRUST_WINDOW_SECS`].
+    pub fn trusted_fingerprint(&self, key: &str, file_size: u64, mtime_secs: i64) -> Option<&str> {
+        let entry = self.entries.get(key)?;
+        if entry.file_size != file_size
+            || entry.mtime_secs != mtime_secs
+            || entry.content_fingerprint == LEGACY_CONTENT_FINGERPRINT
+        {
+            return None;
+        }
+        Some(&entry.content_fingerprint)
     }
 
     pub fn lookup_with_fingerprint(
