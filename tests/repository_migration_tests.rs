@@ -83,12 +83,23 @@ fn release_workflow_uses_repository_urls_and_complete_archive_matrix() {
         );
     }
 
+    // Build jobs hand assets to a single-writer finalize job via artifacts (7c8f52b):
+    // parallel jobs must not upload to the release themselves, or concurrent
+    // softprops uploads recreate the duplicated-draft incident.
     assert!(workflow.contains(
-        "            target/${{ matrix.target }}/release/${{ matrix.asset_name }}.tar.gz\n            target/${{ matrix.target }}/release/${{ matrix.asset_name }}.tar.gz.sha256"
+        "            target/${{ matrix.target }}/release/${{ matrix.asset_name }}.tar.gz*\n            target/${{ matrix.target }}/release/${{ matrix.asset_name }}.zip*"
     ));
-    assert!(workflow.contains(
-        "            target/${{ matrix.target }}/release/${{ matrix.asset_name }}.zip\n            target/${{ matrix.target }}/release/${{ matrix.asset_name }}.zip.sha256"
-    ));
+    assert!(workflow.contains("uses: actions/upload-artifact@v4"));
+    assert!(workflow.contains("merge-multiple: true"));
+    assert!(workflow.contains("gh release upload \"$VERSION\" release-assets/*"));
+    // Only the create-release job may use it; build jobs uploading through it in
+    // parallel is what duplicated the drafts.
+    assert_eq!(
+        workflow
+            .matches("uses: softprops/action-gh-release")
+            .count(),
+        1
+    );
 
     assert!(workflow
         .contains("$checksumLine = \"$($hash.Hash.ToLower())  ${{ matrix.asset_name }}.zip`n\""));
