@@ -69,7 +69,7 @@ impl NavSelect {
 
         // Keep the whole frame shorter than the terminal so MoveUp-based
         // redrawing cannot scroll history away on small windows.
-        let rows = terminal::size().map(|(_, r)| r as usize).unwrap_or(24);
+        let (_, rows) = effective_size(terminal::size().ok());
         let page_size = self.page_size.min(rows.saturating_sub(4)).max(3);
 
         let help = self
@@ -253,6 +253,16 @@ fn truncate_to_width(text: &str, max_cols: usize) -> String {
     result
 }
 
+/// Interpret the reported terminal size, falling back to 80x24 when the report
+/// is missing or degenerate (PTY wrappers like `script` can report 0x0, which
+/// would otherwise squeeze every line to nothing).
+fn effective_size(reported: Option<(u16, u16)>) -> (usize, usize) {
+    match reported {
+        Some((cols, rows)) if cols >= 20 && rows >= 8 => (cols as usize, rows as usize),
+        _ => (80, 24),
+    }
+}
+
 /// Restores the terminal (raw mode off, cursor shown) even on panic.
 struct RawModeGuard;
 
@@ -293,8 +303,8 @@ fn render(
     previous_lines: u16,
 ) -> Result<u16> {
     erase(out, previous_lines)?;
-    let cols = terminal::size().map(|(c, _)| c as usize).unwrap_or(80);
-    let width = cols.saturating_sub(1).max(10);
+    let (cols, _) = effective_size(terminal::size().ok());
+    let width = cols.saturating_sub(1);
     let mut lines: u16 = 0;
 
     let header = format!("? {} {}", prompt, state.filter);
@@ -531,6 +541,17 @@ mod tests {
         assert_eq!(end - start, 5);
         s.handle_key(key(KeyCode::Home));
         assert_eq!(s.visible_window(), (0, 5), "window scrolls back up");
+    }
+
+    #[test]
+    fn effective_size_falls_back_on_degenerate_reports() {
+        // PTYs (e.g. `script`) can report 0x0 or tiny sizes; fall back to 80x24
+        // instead of truncating every line to the minimum.
+        assert_eq!(effective_size(None), (80, 24));
+        assert_eq!(effective_size(Some((0, 0))), (80, 24));
+        assert_eq!(effective_size(Some((10, 5))), (80, 24));
+        assert_eq!(effective_size(Some((120, 40))), (120, 40));
+        assert_eq!(effective_size(Some((20, 8))), (20, 8));
     }
 
     #[test]

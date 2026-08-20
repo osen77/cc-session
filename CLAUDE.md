@@ -388,6 +388,8 @@ ccs session delete <session-id> --force  # 跳过确认
     ↑____________↩︎ 返回上一级
 ```
 
+菜单组件是自研的 `src/nav_select.rs`（不是 inquire::Select——inquire 无自定义按键 API，左右键被它的过滤输入吃掉）：**← 返回上一级，→/Enter 进入选中项**，Esc/Ctrl-C 保持各层原取消语义（顶层退出、操作菜单返回），支持大小写不敏感子串过滤。按键逻辑在纯 `NavState`（无 TTY 可单测），渲染按显示宽度截断（CJK=2 列）防中文标题折行破坏重绘。菜单下标语义由 `session_menu_slot` 纯函数翻译，必须与 `build_session_menu_options` 布局同步。
+
 **核心数据结构**:
 ```rust
 /// 项目摘要
