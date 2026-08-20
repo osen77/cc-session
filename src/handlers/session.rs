@@ -1819,19 +1819,29 @@ fn build_projects_from_sessions(sessions: &[SessionSummary]) -> Vec<ProjectSumma
     projects
 }
 
-/// Detect if current directory corresponds to a Claude project
-pub fn detect_current_project() -> Result<Option<ProjectSummary>> {
-    let cwd = std::env::current_dir()?;
-    let project_name = cwd.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-
-    if project_name.is_empty() {
-        return Ok(None);
+/// Match the current directory's basename against an in-memory project list.
+///
+/// Interactive mode already holds the projects from the cached scan; resolving the
+/// current project here avoids `detect_current_project`'s full legacy re-scan.
+fn find_project_by_dir_name(projects: &[ProjectSummary], cwd: &Path) -> Option<ProjectSummary> {
+    let name = cwd.file_name().and_then(|n| n.to_str())?;
+    if name.is_empty() {
+        return None;
     }
+    projects.iter().find(|p| p.name == name).cloned()
+}
 
-    let projects = scan_all_projects()?;
-
-    // Find project matching current directory name
-    Ok(projects.into_iter().find(|p| p.name == project_name))
+/// Count cleanup-eligible (invalid) sessions for one Claude project directory.
+///
+/// Returns 0 without touching the filesystem when `dir_path` is outside the Claude
+/// root: codex/omp-backed projects must not be fed to the Claude parser.
+fn claude_filtered_session_count_in(project: &ProjectSummary, claude_root: &Path) -> usize {
+    if !project.dir_path.starts_with(claude_root) {
+        return 0;
+    }
+    get_filtered_sessions(project)
+        .map(|filtered| filtered.len())
+        .unwrap_or(0)
 }
 
 /// Append a custom-title entry to a session file.
@@ -3083,17 +3093,14 @@ pub fn handle_session_interactive(
         return Ok(());
     }
 
-    // Try to detect current project or use filter
+    // Try to detect current project or use filter. The projects list from the
+    // cached scan is already in hand, so no legacy re-scan is needed here.
     let initial_project = if let Some(name) = project_filter {
         projects.iter().find(|p| p.name == name).cloned()
     } else {
-        match detect_current_project() {
-            Ok(project) => project,
-            Err(error) => {
-                legacy_io_warning_from_error("claude", "detect_current_project", &error);
-                None
-            }
-        }
+        std::env::current_dir()
+            .ok()
+            .and_then(|cwd| find_project_by_dir_name(&projects, &cwd))
     };
 
     // Start with detected project or project list
@@ -3108,6 +3115,11 @@ pub fn handle_session_interactive(
         );
     }
 
+    // Memoized per-project cleanup counts: computing one requires re-parsing the
+    // project's JSONL files, so don't repeat it on every menu render.
+    let mut filtered_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+
     loop {
         if let Some(ref project) = current_project {
             // Filter sessions for this project from the pre-loaded list
@@ -3119,11 +3131,12 @@ pub fn handle_session_interactive(
 
             // Cleanup count is only meaningful for Claude projects
             let filtered_count = if source.includes_claude() {
-                scan_all_projects()?
-                    .iter()
-                    .find(|p| p.name == project.name)
-                    .map(|p| get_filtered_sessions(p).map(|f| f.len()).unwrap_or(0))
-                    .unwrap_or(0)
+                match claude_projects_dir() {
+                    Ok(claude_root) => *filtered_counts
+                        .entry(project.name.clone())
+                        .or_insert_with(|| claude_filtered_session_count_in(project, &claude_root)),
+                    Err(_) => 0,
+                }
             } else {
                 0
             };
@@ -3216,6 +3229,7 @@ pub fn handle_session_interactive(
                                         source,
                                         include_hidden,
                                     )?;
+                                    filtered_counts.remove(&project.name);
                                 }
                             }
                         }
@@ -3240,6 +3254,7 @@ pub fn handle_session_interactive(
                         source,
                         include_hidden,
                     )?;
+                    filtered_counts.remove(&project.name);
                 }
                 SessionMenuChoice::SwitchProject => {
                     current_project = None;
@@ -6514,10 +6529,9 @@ mod tests {
         std::env::set_var("USERPROFILE", &home);
 
         let projects = scan_all_projects().unwrap();
-        let detected = detect_current_project().unwrap();
 
         assert!(projects.is_empty());
-        assert!(detected.is_none());
+        assert!(find_project_by_dir_name(&projects, Path::new("/Users/mini/home")).is_none());
     }
 
     #[test]
@@ -8538,6 +8552,61 @@ mod tests {
         assert_eq!(second.diagnostics.cache_misses, 1);
         assert!(second.diagnostics.degraded());
         assert!(SessionIndexCache::load(&config).entries.is_empty());
+    }
+
+    fn project_summary_named(name: &str, dir_path: &Path) -> ProjectSummary {
+        ProjectSummary {
+            name: name.to_string(),
+            dir_path: dir_path.to_path_buf(),
+            session_count: 1,
+            last_activity: None,
+        }
+    }
+
+    #[test]
+    fn find_project_by_dir_name_matches_cwd_basename_in_memory() {
+        let projects = vec![
+            project_summary_named("mini", Path::new("/enc/mini")),
+            project_summary_named("demo", Path::new("/enc/demo")),
+        ];
+
+        let hit = find_project_by_dir_name(&projects, Path::new("/Users/mini/work/demo"));
+        assert_eq!(hit.map(|p| p.name), Some("demo".to_string()));
+        assert!(find_project_by_dir_name(&projects, Path::new("/Users/mini/other")).is_none());
+        assert!(find_project_by_dir_name(&projects, Path::new("/")).is_none());
+    }
+
+    #[test]
+    fn claude_filtered_count_only_scans_dirs_under_claude_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let claude_root = temp.path().join("claude");
+        let project_dir = claude_root.join("proj");
+        fs::create_dir_all(&project_dir).unwrap();
+        // One valid session and one with an empty title (cleanup-eligible).
+        fs::write(
+            project_dir.join("valid.jsonl"),
+            concat!(
+                r#"{"type":"user","sessionId":"cc-ok","cwd":"/tmp/demo","timestamp":"2026-08-02T00:00:00Z","message":{"role":"user","content":"hello"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join("empty-title.jsonl"),
+            concat!(
+                r#"{"type":"user","sessionId":"cc-bad","cwd":"/tmp/demo","timestamp":"2026-08-02T00:00:00Z","message":{"role":"user","content":""}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let inside = project_summary_named("proj", &project_dir);
+        assert_eq!(claude_filtered_session_count_in(&inside, &claude_root), 1);
+
+        // A codex/omp-backed project dir outside the Claude root must short-circuit
+        // to zero instead of being parsed with the Claude parser.
+        let outside = project_summary_named("proj", &temp.path().join("omp/proj"));
+        assert_eq!(claude_filtered_session_count_in(&outside, &claude_root), 0);
     }
 
     /// Age a file's mtime past the fingerprint trust window while keeping content.
