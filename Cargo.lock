@@ -218,6 +218,7 @@ dependencies = [
  "chrono",
  "clap",
  "colored",
+ "crossterm",
  "dirs",
  "fs4",
  "hostname",
@@ -232,6 +233,7 @@ dependencies = [
  "serial_test",
  "tempfile",
  "toml",
+ "unicode-width",
  "uuid",
  "walkdir",
 ]

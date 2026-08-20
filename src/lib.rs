@@ -54,6 +54,9 @@ pub mod config;
 pub mod codex;
 pub mod omp;
 
+/// Navigable select menu with Left/Right level navigation for interactive mode.
+pub mod nav_select;
+
 /// Conflict detection and resolution for conversation synchronization.
 ///
 /// Detects when the same conversation has diverged between local and remote copies
