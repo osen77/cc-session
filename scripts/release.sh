@@ -166,7 +166,14 @@ else
 
     echo -e "${CYAN}Updating version to ${NEW_VERSION}...${NC}"
     sed -i '' "s/^version = \"${CURRENT_VERSION}\"/version = \"${NEW_VERSION}\"/" Cargo.toml
-    git add Cargo.toml
+    # Sync Cargo.lock: the release workflow builds with --locked, and a tag whose
+    # lockfile still records the old version fails every platform build (v0.5.6).
+    cargo check --quiet
+    if ! grep -A1 '^name = "claude-code-sync"$' Cargo.lock | grep -q "version = \"${NEW_VERSION}\""; then
+        echo -e "${RED}Error: Cargo.lock did not pick up ${NEW_VERSION}; aborting before tag.${NC}"
+        exit 1
+    fi
+    git add Cargo.toml Cargo.lock
 
     echo -e "${CYAN}Committing...${NC}"
     git commit -m "chore: bump version to ${NEW_VERSION}"
