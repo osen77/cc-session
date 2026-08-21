@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["RepoSource","SyncMode"],"fn":["authenticate_gh","clone_with_retry","confirm_overwrite_and_clone","create_github_repo","ensure_gh_ready","get_os","handle_clone_failure","handle_setup","install_gh_cli","is_gh_authenticated","is_gh_installed","normalize_git_url","print_git_install_instructions"]};

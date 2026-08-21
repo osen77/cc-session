@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["SessionSource","SessionSourceFilter"],"fn":["claude_session_id_from_path","format_relative_time"],"struct":["ProjectSummary","SessionIdentity","SessionSummary","SourceCapabilities"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["are_hooks_installed","handle_hooks_install","handle_hooks_show","handle_hooks_uninstall","handle_new_project_check","handle_session_start","handle_stop"]};

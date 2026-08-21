@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["init_from_onboarding","init_sync_repo"]};

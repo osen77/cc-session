@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ResolutionAction"],"fn":["apply_resolutions","display_conflict_details","is_interactive","resolve_conflict_interactive","resolve_conflicts_interactive","resolve_conflicts_interactive_with_sessions","write_session_within_root"],"struct":["ResolutionResult"]};

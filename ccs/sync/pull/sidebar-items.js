@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["SuppressionApplyOutcome","SuppressionRevalidation"],"fn":["clear_pending_suppression_after_outcome","prepare_local_session_destination","propagate_tombstones","pull_history","revalidate_suppression_for_remote","should_clear_suppression","sync_auto_memory_from_remote","write_session_within_local_root"],"struct":["PendingSuppressionClear"]};

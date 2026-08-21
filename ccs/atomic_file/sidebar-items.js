@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["LOCK_POLL_INTERVAL"],"fn":["open_lock_file","persist_json_atomic","reject_lock_symlink_if_present","set_private_file_permissions","sync_parent_directory","validate_open_lock_path"],"struct":["FileLock"]};

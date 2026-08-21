@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["default_scm_backend","default_sync_subdirectory","expand_tilde","is_valid_git_url"],"struct":["InitConfig","OnboardingConfig"]};

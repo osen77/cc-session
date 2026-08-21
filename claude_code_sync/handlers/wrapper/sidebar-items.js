@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["get_wrapper_path","handle_wrapper_install","handle_wrapper_show","handle_wrapper_uninstall","is_wrapper_installed"]};

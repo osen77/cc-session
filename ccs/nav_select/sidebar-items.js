@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DEFAULT_HELP","DEFAULT_PAGE_SIZE"],"enum":["NavOutcome"],"fn":["effective_size","erase","render","truncate_to_width"],"struct":["NavSelect","NavState","RawModeGuard"]};
