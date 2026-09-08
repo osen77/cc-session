@@ -417,6 +417,12 @@ impl FilterConfig {
         // Check file size
         if let Ok(metadata) = fs::metadata(file_path) {
             if metadata.len() > self.max_file_size_bytes {
+                log::warn!(
+                    "Skipping file larger than max_file_size_bytes: {} ({} bytes > {} bytes)",
+                    file_path.display(),
+                    metadata.len(),
+                    self.max_file_size_bytes
+                );
                 return false;
             }
         }
@@ -963,6 +969,19 @@ mod tests {
 
         // Should include .jsonl that doesn't match exclude pattern
         assert!(config.should_include(&PathBuf::from("/path/prod/session.jsonl")));
+    }
+
+    #[test]
+    fn oversized_file_is_excluded() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("large.jsonl");
+        fs::write(&file, b"12345").unwrap();
+        let config = FilterConfig {
+            max_file_size_bytes: 4,
+            ..Default::default()
+        };
+
+        assert!(!config.should_include(&file));
     }
 
     #[test]

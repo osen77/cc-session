@@ -3,7 +3,9 @@ use colored::Colorize;
 use inquire::Confirm;
 use std::collections::HashMap;
 use std::fs;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use tempfile::NamedTempFile;
 
 use crate::config::ConfigManager;
 use crate::conflict::ConflictDetector;
@@ -49,6 +51,7 @@ enum SuppressionApplyOutcome {
     SkippedNoLocalProject,
     Cancelled,
     WriteFailed,
+    SkippedExistingTarget,
 }
 
 fn should_clear_suppression(outcome: SuppressionApplyOutcome) -> bool {
@@ -139,6 +142,80 @@ fn write_session_within_local_root(
     let destination = prepare_local_session_destination(local_root, relative)?;
     session.write_to_file(&destination)?;
     Ok(destination)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AddedSessionWriteOutcome {
+    Written(PathBuf),
+    SkippedExisting(PathBuf),
+}
+
+fn write_added_session_without_overwrite(
+    session: &ConversationSession,
+    local_root: &Path,
+    relative: &Path,
+) -> Result<AddedSessionWriteOutcome> {
+    write_added_session_without_overwrite_with_hook(session, local_root, relative, |_| Ok(()))
+}
+
+fn write_added_session_without_overwrite_with_hook<F>(
+    session: &ConversationSession,
+    local_root: &Path,
+    relative: &Path,
+    before_commit: F,
+) -> Result<AddedSessionWriteOutcome>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let destination = prepare_local_session_destination(local_root, relative)?;
+    match fs::symlink_metadata(&destination) {
+        Ok(_) => {
+            let destination = prepare_local_session_destination(local_root, relative)?;
+            return Ok(AddedSessionWriteOutcome::SkippedExisting(destination));
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let parent = destination
+        .parent()
+        .context("local session destination has no parent")?;
+    let mut temp = NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "Failed to create temporary session file in {}",
+            parent.display()
+        )
+    })?;
+    for entry in &session.entries {
+        let json =
+            serde_json::to_string(entry).context("Failed to serialize conversation entry")?;
+        writeln!(temp, "{json}").with_context(|| {
+            format!(
+                "Failed to write temporary session file for {}",
+                destination.display()
+            )
+        })?;
+    }
+    temp.flush()?;
+    temp.as_file().sync_all()?;
+
+    // Revalidate immediately before the atomic no-clobber commit. If another
+    // process creates the target first, preserve that file rather than replacing it.
+    prepare_local_session_destination(local_root, relative)?;
+    before_commit(&destination)?;
+    match temp.persist_noclobber(&destination) {
+        Ok(_) => Ok(AddedSessionWriteOutcome::Written(destination)),
+        Err(error) if error.error.kind() == ErrorKind::AlreadyExists => {
+            let destination = prepare_local_session_destination(local_root, relative)?;
+            Ok(AddedSessionWriteOutcome::SkippedExisting(destination))
+        }
+        Err(error) => Err(error.error).with_context(|| {
+            format!(
+                "Failed to create local session without overwriting: {}",
+                destination.display()
+            )
+        }),
+    }
 }
 
 fn propagate_tombstones(local_projects_root: &Path, registry: &TombstoneRegistry) -> Result<usize> {
@@ -948,6 +1025,7 @@ pub fn pull_history(
     let mut modified_count = 0;
     let mut unchanged_count = 0;
     let mut skipped_no_local_match = 0;
+    let mut skipped_existing_target = 0;
 
     for remote_session in &remote_sessions {
         // Skip if conflicts were detected
@@ -1048,12 +1126,56 @@ pub fn pull_history(
                 SyncOperation::Modified
             }
         } else {
-            added_count += 1;
             SyncOperation::Added
         };
 
-        // Copy file if it's not unchanged
-        if operation != SyncOperation::Unchanged {
+        // A remote-only discovery result does not prove the destination is absent:
+        // local filtering or parse errors may have hidden a physical file. Never
+        // replace such a file through the Added path.
+        if operation == SyncOperation::Added {
+            match write_added_session_without_overwrite(
+                remote_session,
+                &claude_dir,
+                &relative_path_for_tracking,
+            ) {
+                Ok(AddedSessionWriteOutcome::Written(_)) => {
+                    added_count += 1;
+                    merged_count += 1;
+                }
+                Ok(AddedSessionWriteOutcome::SkippedExisting(destination)) => {
+                    log::warn!(
+                        "Skipping remote session {} because its local destination already exists but was not discovered; preserving local file: {}",
+                        remote_session.session_id,
+                        destination.display()
+                    );
+                    skipped_existing_target += 1;
+                    let identity = SessionIdentity {
+                        source: SessionSource::Claude,
+                        session_id: remote_session.session_id.clone(),
+                    };
+                    clear_pending_suppression_after_outcome(
+                        maintenance_store.as_ref(),
+                        &pending_suppression_clears,
+                        &identity,
+                        SuppressionApplyOutcome::SkippedExistingTarget,
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    let identity = SessionIdentity {
+                        source: SessionSource::Claude,
+                        session_id: remote_session.session_id.clone(),
+                    };
+                    clear_pending_suppression_after_outcome(
+                        maintenance_store.as_ref(),
+                        &pending_suppression_clears,
+                        &identity,
+                        SuppressionApplyOutcome::WriteFailed,
+                    );
+                    return Err(error);
+                }
+            }
+        } else if operation == SyncOperation::Modified {
             if let Err(error) = write_session_within_local_root(
                 remote_session,
                 &claude_dir,
@@ -1152,6 +1274,13 @@ pub fn pull_history(
             "  {} Skipped (no local match): {}",
             "!".yellow(),
             skipped_no_local_match
+        );
+    }
+    if skipped_existing_target > 0 {
+        println!(
+            "  {} Skipped (existing local target): {}",
+            "!".yellow(),
+            skipped_existing_target
         );
     }
     println!();
@@ -1407,6 +1536,13 @@ mod tests {
     }
 
     #[test]
+    fn existing_target_skip_keeps_suppression_pending() {
+        assert!(!should_clear_suppression(
+            SuppressionApplyOutcome::SkippedExistingTarget
+        ));
+    }
+
+    #[test]
     fn successful_active_write_clears_suppression_pending() {
         assert!(should_clear_suppression(SuppressionApplyOutcome::Written));
         assert!(should_clear_suppression(SuppressionApplyOutcome::Unchanged));
@@ -1460,6 +1596,7 @@ mod tests {
             SuppressionApplyOutcome::Cancelled,
             SuppressionApplyOutcome::SkippedNoLocalProject,
             SuppressionApplyOutcome::WriteFailed,
+            SuppressionApplyOutcome::SkippedExistingTarget,
         ] {
             clear_pending_suppression_after_outcome(Some(&store), &pending, &identity, outcome);
             assert!(store
@@ -1527,6 +1664,121 @@ mod tests {
         assert!(destination.is_file());
     }
 
+    fn session_json(session_id: &str, content: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "sessionId": session_id,
+            "timestamp": "2026-09-09T00:00:00Z",
+            "cwd": "/tmp/project",
+            "message": {"role": "user", "content": content}
+        })
+        .to_string()
+            + "\n"
+    }
+
+    #[test]
+    fn oversized_local_session_is_not_overwritten_as_added() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_root = temp.path().join("local");
+        let remote_root = temp.path().join("remote");
+        let relative = Path::new("project/session-id.jsonl");
+        let local_file = local_root.join(relative);
+        let remote_file = remote_root.join(relative);
+        fs::create_dir_all(local_file.parent().unwrap()).unwrap();
+        fs::create_dir_all(remote_file.parent().unwrap()).unwrap();
+        let local_bytes = session_json("session-id", &"x".repeat(512)).into_bytes();
+        fs::write(&local_file, &local_bytes).unwrap();
+        fs::write(&remote_file, session_json("session-id", "remote")).unwrap();
+        let filter = FilterConfig {
+            max_file_size_bytes: 256,
+            ..FilterConfig::default()
+        };
+
+        assert!(discover_sessions(&local_root, &filter).unwrap().is_empty());
+        let remote_session = discover_sessions(&remote_root, &filter)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(matches!(
+            write_added_session_without_overwrite(&remote_session, &local_root, relative).unwrap(),
+            AddedSessionWriteOutcome::SkippedExisting(path) if path == local_file
+        ));
+        assert_eq!(fs::read(&local_file).unwrap(), local_bytes);
+    }
+
+    #[test]
+    fn added_session_write_skips_existing_filtered_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_root = temp.path().join("local");
+        let relative = Path::new("project/session-id.jsonl");
+        let destination = local_root.join(relative);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"filtered-local-original").unwrap();
+        let session = ConversationSession {
+            session_id: "session-id".to_string(),
+            entries: Vec::new(),
+            file_path: String::new(),
+        };
+
+        assert!(matches!(
+            write_added_session_without_overwrite(&session, &local_root, relative).unwrap(),
+            AddedSessionWriteOutcome::SkippedExisting(path) if path == destination
+        ));
+        assert_eq!(fs::read(&destination).unwrap(), b"filtered-local-original");
+    }
+
+    #[test]
+    fn added_session_write_loses_create_race_without_overwriting_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_root = temp.path().join("local");
+        fs::create_dir_all(&local_root).unwrap();
+        let relative = Path::new("project/session-id.jsonl");
+        let destination = local_root.join(relative);
+        let session = ConversationSession {
+            session_id: "session-id".to_string(),
+            entries: Vec::new(),
+            file_path: String::new(),
+        };
+
+        assert!(matches!(
+            write_added_session_without_overwrite_with_hook(
+                &session,
+                &local_root,
+                relative,
+                |path| {
+                    fs::write(path, b"race-winner")?;
+                    Ok(())
+                },
+            )
+            .unwrap(),
+            AddedSessionWriteOutcome::SkippedExisting(path) if path == destination
+        ));
+        assert_eq!(fs::read(&destination).unwrap(), b"race-winner");
+    }
+
+    #[test]
+    fn added_session_write_creates_absent_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_root = temp.path().join("local");
+        fs::create_dir_all(&local_root).unwrap();
+        let relative = Path::new("project/session-id.jsonl");
+        let destination = local_root.join(relative);
+        let source = temp.path().join("source.jsonl");
+        fs::write(&source, session_json("session-id", "remote")).unwrap();
+        let session = ConversationSession::from_file(&source).unwrap();
+
+        assert_eq!(
+            write_added_session_without_overwrite(&session, &local_root, relative).unwrap(),
+            AddedSessionWriteOutcome::Written(destination.clone())
+        );
+        assert_eq!(
+            ConversationSession::from_file(&destination)
+                .unwrap()
+                .session_id,
+            "session-id"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn guarded_session_write_rejects_project_and_file_symlinks() {
@@ -1563,6 +1815,12 @@ mod tests {
                 file_path: String::new(),
             };
             assert!(write_session_within_local_root(
+                &session,
+                &local_root,
+                Path::new("project/session-id.jsonl"),
+            )
+            .is_err());
+            assert!(write_added_session_without_overwrite(
                 &session,
                 &local_root,
                 Path::new("project/session-id.jsonl"),
