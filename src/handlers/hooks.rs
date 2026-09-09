@@ -828,16 +828,8 @@ fn run_stop_worker() {
         return;
     }
 
-    if let Ok(filter) = crate::filter::FilterConfig::load() {
-        if filter.config_sync.enabled {
-            match super::config_sync::handle_config_push(&filter.config_sync) {
-                Ok(()) => append_hook_debug("Stop worker config push completed"),
-                Err(error) => append_hook_debug(&format!(
-                    "Stop worker config push failed (history push kept): {error:#}"
-                )),
-            }
-        }
-    }
+    // Device config sync already happens inside push_history (sync_config=true),
+    // which respects the user's push_with_config setting; do not push config again.
 
     let mut state = PushHookState::load();
     state.record_success(unix_now());
