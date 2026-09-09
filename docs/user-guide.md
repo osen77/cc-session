@@ -69,6 +69,8 @@ ccs update
 curl -fsSL https://github.com/osen77/cc-session/releases/latest/download/ccs-macos-aarch64.tar.gz | tar xz && sudo mv ccs $(which ccs)
 ```
 
+> **注意**：更新完成后，`ccs update` 会自动检测 hook 配置是否与新版本一致。如果提示 `Hook 配置需要更新`，请按提示运行 `ccs hooks install` 刷新配置（如更新 Stop hook 超时与后台推送配置）。
+
 > 将 URL 中的 `ccs-macos-aarch64` 替换为你的平台：`ccs-macos-x86_64`（Intel Mac）、`ccs-linux-x86_64`（Linux）。
 
 ---
@@ -213,7 +215,7 @@ alias claude='claude-sync'
 ```
 启动时: claude-sync → 自动 pull → 启动 Claude Code
 使用中: 检测新项目 → 自动 pull 该项目历史
-每轮对话结束: Stop Hook → 自动 push
+每轮对话结束: Stop Hook → 后台节流推送
 ```
 
 ### 管理命令
@@ -226,9 +228,10 @@ ccs automate --status
 ccs automate --uninstall
 
 # 单独管理 hooks
-ccs hooks install    # 安装 hooks
-ccs hooks uninstall  # 卸载 hooks
-ccs hooks show       # 查看状态
+ccs hooks install          # 安装 / 刷新 hooks
+ccs hooks uninstall        # 卸载 hooks
+ccs hooks show             # 查看状态
+ccs hooks check [--quiet]  # 检查 hook 配置是否与当前版本一致（漂移检测）
 
 # 单独管理包装脚本
 ccs wrapper install    # 创建 claude-sync
@@ -241,7 +244,7 @@ ccs wrapper show       # 查看状态
 | Hook | 触发时机 | 功能 |
 |------|----------|------|
 | `SessionStart` | Claude Code 首次启动时 | 拉取最新历史（三重条件检测） |
-| `Stop` | 每轮对话完成后 | 推送对话历史 |
+| `Stop` | 每轮对话完成后 | 节流 5 分钟、后台推送、连续失败 3 次后下一轮提示 |
 | `UserPromptSubmit` | 每次发送消息时 | 检测新项目并拉取远程历史 |
 
 > **SessionStart 三重条件检测**：只有同时满足以下条件才会执行 pull：
@@ -262,6 +265,14 @@ cat ~/Library/Application\ Support/claude-code-sync/hook-debug.log
 # Linux
 cat ~/.config/claude-code-sync/hook-debug.log
 ```
+
+**后台推送状态文件**（位于配置目录，macOS 为 `~/Library/Application Support/claude-code-sync/`，Linux 为 `~/.config/claude-code-sync/`，Windows 为 `%APPDATA%\claude-code-sync\`）：
+
+| 状态文件 | 用途与含义 |
+|---------|-----------|
+| `push-hook.lock` | 后台 worker 进程互斥锁。基于文件锁（flock）保证同一时刻仅有一个 worker 执行推送，进程退出自动释放。 |
+| `push-hook-state.json` | 推送状态与失败计数（原子写入）。记录连续失败次数（`consecutive_failures`）、已告警次数、最后成功/失败时间及错误信息。连续失败达到 3 次后由下一轮前台 hook 提示告警。 |
+| `push-hook.stamp` | 5 分钟节流标记文件。仅在后台 worker 真实推送成功后更新（`touch`）。若当前时间距离该文件修改时间不足 300 秒，Stop hook 跳过本次推送。 |
 
 ---
 
@@ -633,6 +644,7 @@ ccs unlock-delete --off           # 提前关闭
 | `ccs config-sync apply <device>` | 应用其他设备配置 |
 | `ccs config-sync status` | 查看配置同步状态 |
 | `ccs hooks show` | 查看 hooks 状态 |
+| `ccs hooks check` | 检查 hooks 配置漂移（`--quiet` 仅输出单行提示） |
 | `ccs wrapper show` | 查看包装脚本状态 |
 | `ccs update` | 更新到最新版本 |
 | `ccs uninstall` | 卸载并清理所有数据 |
@@ -888,4 +900,4 @@ ccs uninstall --force
 
 ---
 
-*最后更新: 2026-03-26*
+*最后更新: 2026-09-09*

@@ -129,6 +129,21 @@ impl ConfigManager {
         Ok(Self::config_dir()?.join(format!("sync-repo-{short}.lock")))
     }
 
+    /// Get the lock file guarding the detached Stop-hook worker.
+    pub fn push_hook_lock_path() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("push-hook.lock"))
+    }
+
+    /// Get the detached Stop-hook worker state file.
+    pub fn push_hook_state_path() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("push-hook-state.json"))
+    }
+
+    /// Get the detached Stop-hook throttle stamp file.
+    pub fn push_hook_stamp_path() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("push-hook.stamp"))
+    }
+
     /// Get the session recycle directory path.
     #[allow(dead_code)]
     pub fn session_recycle_dir() -> Result<PathBuf> {
@@ -177,6 +192,12 @@ mod tests {
             std::env::set_var(key, value);
             Self { key, original }
         }
+
+        fn remove(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, original }
+        }
     }
 
     impl Drop for EnvGuard {
@@ -191,9 +212,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_config_paths() {
-        // Just ensure they don't panic and return valid paths
+        // Ensure every derived path stays under the selected config directory.
         let config_dir = ConfigManager::config_dir().unwrap();
-        assert!(config_dir.to_string_lossy().contains("claude-code-sync"));
 
         let state_path = ConfigManager::state_file_path().unwrap();
         assert!(state_path.to_string_lossy().contains("state.json"));
@@ -232,6 +252,15 @@ mod tests {
             config_dir.join("session-maintenance.lock")
         );
 
+        let push_hook_lock = ConfigManager::push_hook_lock_path().unwrap();
+        assert_eq!(push_hook_lock, config_dir.join("push-hook.lock"));
+
+        let push_hook_state = ConfigManager::push_hook_state_path().unwrap();
+        assert_eq!(push_hook_state, config_dir.join("push-hook-state.json"));
+
+        let push_hook_stamp = ConfigManager::push_hook_stamp_path().unwrap();
+        assert_eq!(push_hook_stamp, config_dir.join("push-hook.stamp"));
+
         let recycle = ConfigManager::session_recycle_dir().unwrap();
         assert_eq!(recycle, config_dir.join("session-recycle"));
     }
@@ -240,7 +269,8 @@ mod tests {
     #[serial]
     #[cfg(target_os = "linux")]
     fn test_xdg_config_home_respected() {
-        let _guard = EnvGuard::set("XDG_CONFIG_HOME", "/tmp/test-xdg-config");
+        let _config_guard = EnvGuard::remove(CONFIG_DIR_ENV);
+        let _xdg_guard = EnvGuard::set("XDG_CONFIG_HOME", "/tmp/test-xdg-config");
         let config_dir = ConfigManager::config_dir().unwrap();
         assert!(config_dir
             .to_string_lossy()
@@ -251,6 +281,7 @@ mod tests {
     #[serial]
     #[cfg(target_os = "macos")]
     fn test_macos_library_path() {
+        let _guard = EnvGuard::remove(CONFIG_DIR_ENV);
         let config_dir = ConfigManager::config_dir().unwrap();
         assert!(config_dir
             .to_string_lossy()

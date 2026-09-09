@@ -124,6 +124,10 @@ fn validate_open_lock_path(lock_path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn persist_json_pretty_atomic<T: Serialize>(target: &Path, value: &T) -> Result<()> {
+    persist_json_bytes_atomic(target, serde_json::to_vec_pretty(value)?)
+}
+
 pub(crate) fn persist_json_atomic<T: Serialize>(target: &Path, value: &T) -> Result<()> {
     #[cfg(test)]
     {
@@ -136,9 +140,12 @@ pub(crate) fn persist_json_atomic<T: Serialize>(target: &Path, value: &T) -> Res
             anyhow::bail!("test atomic persist failure");
         }
     }
+    persist_json_bytes_atomic(target, serde_json::to_vec(value)?)
+}
+
+fn persist_json_bytes_atomic(target: &Path, bytes: Vec<u8>) -> Result<()> {
     let parent = target.parent().context("JSON target has no parent")?;
     std::fs::create_dir_all(parent)?;
-    let bytes = serde_json::to_vec(value)?;
     let mut temp = NamedTempFile::new_in(parent)?;
     set_private_file_permissions(temp.as_file())?;
     temp.write_all(&bytes)?;
@@ -235,6 +242,15 @@ mod tests {
         persist_json_atomic(&target, &Payload { value: 2 }).unwrap();
         let loaded: Payload = serde_json::from_slice(&std::fs::read(target).unwrap()).unwrap();
         assert_eq!(loaded, Payload { value: 2 });
+    }
+
+    #[test]
+    fn persist_json_pretty_atomic_writes_formatted_json() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("settings.json");
+        persist_json_pretty_atomic(&target, &Payload { value: 2 }).unwrap();
+        let content = std::fs::read_to_string(target).unwrap();
+        assert!(content.contains("\n  \"value\": 2\n"));
     }
 
     #[test]

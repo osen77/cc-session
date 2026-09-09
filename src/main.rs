@@ -356,7 +356,11 @@ enum Commands {
 
     /// Internal command for Stop hook (push after each response)
     #[command(hide = true)]
-    HookStop,
+    HookStop {
+        /// Run the detached push worker
+        #[arg(long, hide = true)]
+        worker: bool,
+    },
 
     /// Manage Claude Code conversation sessions
     Session {
@@ -469,6 +473,13 @@ enum HooksAction {
 
     /// Show current hooks configuration status
     Show,
+
+    /// Check whether installed hooks match this ccs version
+    Check {
+        /// Print only a one-line mismatch message
+        #[arg(long)]
+        quiet: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -743,12 +754,18 @@ fn finish_json_aware(result: Result<()>, json: bool) -> Result<()> {
 fn main() -> Result<()> {
     // Parse CLI arguments before initializing logging so logger options are available.
     let cli = Cli::parse();
+    let foreground_stop = matches!(
+        cli.command.as_ref(),
+        Some(Commands::HookStop { worker: false })
+    );
     let rust_log = std::env::var("RUST_LOG").ok();
-    let logger_status = logger::init_logger_with_options(logger::LoggerOptions::new(
-        cli.debug,
-        cli.log_file.clone(),
-        rust_log.as_deref(),
-    )?)?;
+    let logger_options =
+        logger::LoggerOptions::new(cli.debug, cli.log_file.clone(), rust_log.as_deref())?;
+    let logger_status = if foreground_stop {
+        logger::init_console_logger_with_options(logger_options)?
+    } else {
+        logger::init_logger_with_options(logger_options)?
+    };
 
     if let Some(warning) = &logger_status.warning {
         eprintln!("WARNING: {warning}");
@@ -767,6 +784,10 @@ fn main() -> Result<()> {
             | Commands::Status { .. }
             | Commands::Report { .. }
             | Commands::History { .. }
+            | Commands::Hooks { .. }
+            | Commands::HookStop { .. }
+            | Commands::HookSessionStart
+            | Commands::HookNewProjectCheck
     );
     let update_check_handle = (!is_update_command && !is_local_command)
         .then(|| std::thread::spawn(check_for_update_silent));
@@ -788,6 +809,11 @@ fn main() -> Result<()> {
     let is_update_command = matches!(command, Commands::Update { .. });
     let is_uninstall_command = matches!(command, Commands::Uninstall { .. });
     let is_unlock_delete_command = matches!(command, Commands::UnlockDelete { .. });
+    let is_hooks_command = matches!(command, Commands::Hooks { .. });
+    let is_hook_command = matches!(
+        command,
+        Commands::HookStop { .. } | Commands::HookSessionStart | Commands::HookNewProjectCheck
+    );
 
     // Run onboarding if needed (skip for commands that don't require sync repo)
     if needs_onboarding
@@ -798,6 +824,8 @@ fn main() -> Result<()> {
         && !is_update_command
         && !is_uninstall_command
         && !is_unlock_delete_command
+        && !is_hooks_command
+        && !is_hook_command
     {
         log::info!("Running onboarding flow - first time setup detected");
 
@@ -1118,6 +1146,14 @@ fn main() -> Result<()> {
             HooksAction::Show => {
                 handle_hooks_show()?;
             }
+            HooksAction::Check { quiet } => {
+                if let Err(error) = handlers::hooks::handle_hooks_check(quiet) {
+                    if quiet {
+                        std::process::exit(1);
+                    }
+                    return Err(error);
+                }
+            }
         },
         Commands::Wrapper { action } => match action {
             WrapperAction::Install { force } => {
@@ -1145,8 +1181,8 @@ fn main() -> Result<()> {
         Commands::HookSessionStart => {
             handle_session_start()?;
         }
-        Commands::HookStop => {
-            handle_stop()?;
+        Commands::HookStop { worker } => {
+            handle_stop(worker)?;
         }
         Commands::ConfigSync { action } => {
             let filter_config = filter::FilterConfig::load()?;

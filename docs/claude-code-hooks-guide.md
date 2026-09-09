@@ -147,6 +147,23 @@ macOS 上 `pgrep -f` 匹配命令行时有长度限制，可能导致漏匹配�
 
 某些情况下 SessionStart 会触发两次（如 IDE 的多次初始化）。需要用防抖机制处理。
 
+### 陷阱 5：Stop hook 同步执行会阻塞每一轮对话
+
+`hook-stop` 要 git push，一次约 20 秒。Stop 事件在**每轮对话结束时**同步等待，所以这 20 秒直接加在用户面前。
+
+只加节流不够。实测 556 次运行：中位 **14.0 秒**、p90 19.2 秒、最差 60 秒并撞了 2 次超时——因为对话轮次的实际间隔通常比 `THROTTLE=300` 还长，多数 Stop 事件都能通过节流检查，于是每轮都在付全额 push。节流只在密集对话时有用，而密集对话恰恰不是常态。
+
+正确做法是在 `ccs hook-stop` 内把 push 分离到后台 detached worker，前台仅做节流与告警检查并立即返回（hook timeout 缩减到 10 秒）。几个关键的底层处理细节：
+
+- **前台不持锁，由 worker 自行取锁**：标准库打开的 fd 均带有 `O_CLOEXEC`，文件锁（flock）无法传递给子进程。因此由后台 worker 启动后通过 `FileLock::try_acquire` 竞争 `push-hook.lock`，竞争失败说明已有 worker 在运行，直接退出 0 跳过；锁随进程消亡由操作系统自动释放，省去维护锁龄的额外逻辑。
+- **三路标准流全重定向到 null**（stdin/stdout/stderr 置空）：如果只后台化子进程而不重定向 stdio，hook runner 仍会阻塞等待管道关闭，达不到异步返回的效果。
+- **脱离会话与孤儿进程保活**：Unix 下在 `pre_exec` 中调用 `libc::setsid()` 建立新 session 脱离控制终端；Windows 下配置 `creation_flags` 为 `DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`（并尝试 `CREATE_BREAKAWAY_FROM_JOB` 脱离作业对象），确保父进程退出后 worker 进程不被关联终止。
+
+后台化后，worker 的退出码无法直接传递给 Claude Code。因此改用持久化状态文件（`push-hook-state.json`）记录失败情况：
+- **连续失败告警**：worker 成功时重置计数并更新 `push-hook.stamp`（300 秒节流时间戳）；连续失败达到阈值 3 次时，由**下一次前台运行**输出告警。
+- **退出码选择 1 而非 2**：Stop 钩子的 `exit 2` 是 blocking error，会把 stderr 注入上下文并阻止本轮结束；退出码 1 是 non-blocking error，只把 stderr（包含查看 `hook-debug.log` 的提示）显示给用户，不打断交互。
+- **告警去重**：通过 `alerted_failures` 记录已告警次数，仅在失败次数增加时再次提醒，避免每轮刷屏。告警滞后一轮（前台读到的是上一轮 worker 的结果），数字是下界。
+
 ## 7. 最佳实践
 
 1. **多条件组合**：单一条件往往不够，需要组合多个条件
@@ -162,4 +179,4 @@ macOS 上 `pgrep -f` 匹配命令行时有长度限制，可能导致漏匹配�
 
 ---
 
-*最后更新: 2026-02-04*
+*最后更新: 2026-09-09*

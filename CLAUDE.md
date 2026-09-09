@@ -182,7 +182,7 @@ Codex/OMP 的普通 rename/delete 仍为只读；本地维护只移动和恢复�
 
 1. **Hooks** (`hooks.rs`): Claude Code 原生钩子
    - `SessionStart`: **首次启动**时自动拉取远程历史（三重条件检测：进程数=1 + source=startup + 5分钟防抖）
-   - `Stop`: 每轮对话完成后自动推送对话历史
+   - `Stop`: 每轮对话完成后后台节流推送（节流 5 分钟、连续失败 3 次后下一轮提示）
    - `UserPromptSubmit`: 检测新项目并拉取远程历史
 
 2. **Wrapper** (`wrapper.rs`): 启动包装脚本
@@ -202,7 +202,7 @@ ccs automate --status
 ccs automate --uninstall
 
 # 单独管理 hooks
-ccs hooks install|uninstall|show
+ccs hooks install|uninstall|show|check
 
 # 单独管理 wrapper
 ccs wrapper install|uninstall|show
@@ -224,7 +224,7 @@ ccs wrapper install|uninstall|show
 │            │                                                │
 │            ├─> UserPromptSubmit Hook: 检测新项目            │
 │            │                                                │
-│            └─> Stop Hook: push (每轮对话后推送)             │
+│            └─> Stop Hook: 后台节流推送                      │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -232,6 +232,7 @@ ccs wrapper install|uninstall|show
 **配置文件位置**:
 - Hooks: `~/.claude/settings.json`
 - Wrapper: 与 `ccs` 同目录下的 `claude-sync`
+- 状态文件（位于 config_dir）: `push-hook.lock`（worker 互斥锁）、`push-hook-state.json`（推送失败计数与状态）、`push-hook.stamp`（节流时间戳）
 
 **调试日志**:
 ```bash
@@ -728,4 +729,4 @@ fn test_skip_snapshot_files() {
 
 ---
 
-*最后更新: 2026-08-09*
+*最后更新: 2026-09-09*

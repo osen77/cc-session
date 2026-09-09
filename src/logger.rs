@@ -1108,13 +1108,25 @@ fn open_log_file(path: &Path) -> Result<File> {
     open_log_file_locked(path)
 }
 
+#[cfg(test)]
 fn build_logger(options: &LoggerOptions) -> Result<(DualLogger, Option<String>)> {
-    let (file, warning) = match open_log_file(&options.log_path) {
-        Ok(_) => (Some(FileSink::Path(options.log_path.clone())), None),
-        Err(_) => (
-            None,
-            Some("file logging unavailable; continuing with stderr logs".to_string()),
-        ),
+    build_logger_with_file_sink(options, true)
+}
+
+fn build_logger_with_file_sink(
+    options: &LoggerOptions,
+    file_sink_enabled: bool,
+) -> Result<(DualLogger, Option<String>)> {
+    let (file, warning) = if file_sink_enabled {
+        match open_log_file(&options.log_path) {
+            Ok(_) => (Some(FileSink::Path(options.log_path.clone())), None),
+            Err(_) => (
+                None,
+                Some("file logging unavailable; continuing with stderr logs".to_string()),
+            ),
+        }
+    } else {
+        (None, None)
     };
     let mut logger = DualLogger::with_writers(
         options.console_level,
@@ -1129,12 +1141,24 @@ fn build_logger(options: &LoggerOptions) -> Result<(DualLogger, Option<String>)>
 }
 
 /// Initialize the logger with explicit options and report file-sink degradation.
-pub fn init_logger_with_options(mut options: LoggerOptions) -> Result<LoggerInitStatus> {
+pub fn init_logger_with_options(options: LoggerOptions) -> Result<LoggerInitStatus> {
+    initialize_logger(options, true)
+}
+
+/// Initialize a console-only logger without opening or locking the file sink.
+pub fn init_console_logger_with_options(options: LoggerOptions) -> Result<LoggerInitStatus> {
+    initialize_logger(options, false)
+}
+
+fn initialize_logger(
+    mut options: LoggerOptions,
+    file_sink_enabled: bool,
+) -> Result<LoggerInitStatus> {
     options.invocation_id =
         validate_invocation_id(&options.invocation_id).map(|_| options.invocation_id.clone())?;
     let log_path = options.log_path.clone();
     let invocation_id = options.invocation_id.clone();
-    let (logger, warning) = build_logger(&options)?;
+    let (logger, warning) = build_logger_with_file_sink(&options, file_sink_enabled)?;
     let file_logging_enabled = logger.file.is_some();
     let max_level = std::cmp::max(options.console_level, options.file_level);
 

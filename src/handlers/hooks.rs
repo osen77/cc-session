@@ -5,18 +5,28 @@
 
 use anyhow::{Context, Result};
 use colored::Colorize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::BINARY_NAME;
+use crate::atomic_file::{persist_json_atomic, persist_json_pretty_atomic, FileLock};
+use crate::config::ConfigManager;
+use crate::sync::repo_lock::{RepoLock, RepoLockOutcome};
+use crate::sync::SyncState;
+use crate::{VerbosityLevel, BINARY_NAME};
 
-/// Identifiers for hooks installed by us (old name + new name)
-const HOOK_MARKERS: &[&str] = &["claude-code-sync", "ccs"];
+/// Executable basenames owned by this project (old name + new name).
+const HOOK_EXECUTABLES: &[&str] = &["claude-code-sync", "claude-code-sync.exe", "ccs", "ccs.exe"];
+const PUSH_HOOK_THROTTLE_SECS: u64 = 300;
+const PUSH_HOOK_ALERT_THRESHOLD: u32 = 3;
+const HOOK_FIELDS: &[&str] = &["type", "command", "timeout", "statusMessage"];
 
 fn append_hook_debug(message: &str) {
     use std::io::Write;
 
-    let Ok(config_dir) = crate::config::ConfigManager::ensure_config_dir() else {
+    let Ok(config_dir) = ConfigManager::ensure_config_dir() else {
         return;
     };
     let debug_log = config_dir.join("hook-debug.log");
@@ -31,43 +41,91 @@ fn append_hook_debug(message: &str) {
     let _ = writeln!(file, "[{timestamp}] {message}");
 }
 
-/// Spawn a ccs subcommand as a detached child process.
-///
-/// Uses `current_exe()` so the child resolves to the same binary regardless of
-/// the ambient PATH — important in Claude Code hook environments where PATH
-/// may not include the cargo bin directory. Falls back to the bare binary name
-/// if `current_exe()` fails (keeps old behavior, never worse).
+/// Spawn a ccs subcommand and wait for it to finish.
 fn spawn_ccs_subcommand(
     subcommand: &str,
     args: &[&str],
 ) -> std::io::Result<std::process::ExitStatus> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(BINARY_NAME));
-    std::process::Command::new(exe)
+    Command::new(exe)
         .arg(subcommand)
         .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
 }
 
-/// Get the path to Claude settings file
+fn detached_worker_command(exe: &Path) -> Command {
+    let mut command = Command::new(exe);
+    command
+        .args(["hook-stop", "--worker"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+/// Spawn the Stop-hook worker without waiting for it.
+fn spawn_detached_worker() -> std::io::Result<Child> {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(BINARY_NAME));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let mut command = detached_worker_command(&exe);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn()
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const BASE_FLAGS: u32 = DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+
+        let mut command = detached_worker_command(&exe);
+        command.creation_flags(BASE_FLAGS | CREATE_BREAKAWAY_FROM_JOB);
+        match command.spawn() {
+            Ok(child) => Ok(child),
+            Err(first_error) => {
+                let mut fallback = detached_worker_command(&exe);
+                fallback.creation_flags(BASE_FLAGS);
+                fallback.spawn().map_err(|fallback_error| {
+                    std::io::Error::new(
+                        fallback_error.kind(),
+                        format!(
+                            "detached spawn with breakaway failed ({first_error}); fallback failed ({fallback_error})"
+                        ),
+                    )
+                })
+            }
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        detached_worker_command(&exe).spawn()
+    }
+}
+
+/// Get the path to Claude settings file.
 fn claude_settings_path() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Cannot find home directory")?;
     Ok(home.join(".claude").join("settings.json"))
 }
 
 /// Build the command string written into settings.json for a hook subcommand.
-///
-/// Claude Code runs this string via its own shell, whose PATH does NOT include
-/// the cargo bin directory — so a bare `ccs` fails with "command not found".
-/// We resolve the running binary's absolute path at install time via
-/// `current_exe()`; each device writes its own real path (hooks are not synced
-/// across devices — `config_sync` strips the `hooks` field). The path is always
-/// double-quoted so one containing spaces (e.g. Windows
-/// `C:\Users\<name with space>\.cargo\bin\ccs.exe`) survives shell
-/// word-splitting on both sh and cmd. Falls back to the bare binary name if
-/// `current_exe()` fails (no worse than the old behavior).
 fn hook_command(subcommand: &str) -> String {
     let exe = std::env::current_exe()
         .ok()
@@ -76,7 +134,7 @@ fn hook_command(subcommand: &str) -> String {
     format!("\"{}\" {}", exe, subcommand)
 }
 
-/// Get the hooks configuration to install
+/// Get the hooks configuration to install.
 fn get_hooks_config() -> Value {
     json!({
         "SessionStart": [
@@ -97,7 +155,7 @@ fn get_hooks_config() -> Value {
                     {
                         "type": "command",
                         "command": hook_command("hook-stop"),
-                        "timeout": 60
+                        "timeout": 10
                     }
                 ]
             }
@@ -116,75 +174,228 @@ fn get_hooks_config() -> Value {
     })
 }
 
-/// Check if a hook array contains one of our hooks (matching by subcommand suffix)
-fn contains_our_hook(hooks_array: &[Value], subcommand: &str) -> bool {
-    hooks_array.iter().any(|group| {
-        group
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .map(|hooks| {
-                hooks.iter().any(|hook| {
-                    hook.get("command")
-                        .and_then(|c| c.as_str())
-                        .map(|cmd| {
-                            HOOK_MARKERS.iter().any(|marker| cmd.contains(marker))
-                                && cmd.contains(subcommand)
-                        })
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
+fn first_command_token(cmd: &str) -> Option<&str> {
+    let trimmed = cmd.trim_start();
+    let first = trimmed.as_bytes().first().copied()?;
+    if first == b'"' || first == b'\'' {
+        let quote = first as char;
+        let rest = &trimmed[1..];
+        let end = rest.find(quote)?;
+        Some(&rest[..end])
+    } else {
+        trimmed.split_whitespace().next()
+    }
+}
+
+fn command_basename(cmd: &str) -> Option<&str> {
+    first_command_token(cmd)?
+        .rsplit(['/', '\\'])
+        .find(|component| !component.is_empty())
+}
+
+fn subcommand_of(cmd: &str) -> Option<&str> {
+    cmd.split_whitespace()
+        .find(|token| token.starts_with("hook-"))
+}
+
+fn is_our_hook_command(cmd: &str) -> bool {
+    let Some(basename) = command_basename(cmd) else {
+        return false;
+    };
+    HOOK_EXECUTABLES
+        .iter()
+        .any(|candidate| basename.eq_ignore_ascii_case(candidate))
+        && subcommand_of(cmd).is_some()
+}
+
+fn is_ours_for(cmd: &str, subcommand: &str) -> bool {
+    is_our_hook_command(cmd) && subcommand_of(cmd) == Some(subcommand)
+}
+
+fn is_legacy_stop_wrapper(cmd: &str) -> bool {
+    command_basename(cmd).is_some_and(|basename| {
+        matches!(
+            basename.to_ascii_lowercase().as_str(),
+            "throttled-stop" | "throttled-stop.sh" | "throttled-stop.bat" | "throttled-stop.ps1"
+        )
     })
 }
 
-/// Check if a hook command belongs to us (matches any of HOOK_MARKERS)
-fn is_our_hook_command(cmd: &str) -> bool {
-    HOOK_MARKERS.iter().any(|marker| cmd.contains(marker))
+fn hook_values<'a>(settings: &'a Value, event_name: &str) -> Vec<&'a Value> {
+    settings
+        .get("hooks")
+        .and_then(Value::as_object)
+        .and_then(|hooks| hooks.get(event_name))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .collect()
 }
 
-/// Refresh our existing hook's command string to `new_command` in place.
-///
-/// Matches precisely on our marker ("ccs" / "claude-code-sync") AND the
-/// `hook-*` subcommand, so custom user wrappers (e.g. `throttled-stop.sh`,
-/// which carries neither marker nor the subcommand) are never touched. This is
-/// what lets `hooks install` self-heal a device that was set up with an older
-/// bare `ccs hook-*` command: re-running install rewrites it to the absolute
-/// path instead of skipping. Returns true if a matching hook was updated.
-fn update_our_hook_command(existing: &mut [Value], subcommand: &str, new_command: &str) -> bool {
-    let mut updated = false;
-    for group in existing.iter_mut() {
-        if let Some(hooks) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
-            for hook in hooks.iter_mut() {
-                let is_ours = hook
-                    .get("command")
-                    .and_then(|c| c.as_str())
-                    .map(|cmd| is_our_hook_command(cmd) && cmd.contains(subcommand))
-                    .unwrap_or(false);
-                if is_ours {
-                    hook["command"] = json!(new_command);
-                    updated = true;
+fn expected_hook<'a>(expected: &'a Value, event_name: &str) -> Option<&'a Value> {
+    expected
+        .get(event_name)?
+        .as_array()?
+        .first()?
+        .get("hooks")?
+        .as_array()?
+        .first()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HookDrift {
+    Missing { event: String },
+    LegacyWrapper { event: String },
+    FieldMismatch { event: String, field: String },
+}
+
+impl HookDrift {
+    fn description(&self) -> String {
+        match self {
+            Self::Missing { event } => format!("{event}: 缺少 ccs hook"),
+            Self::LegacyWrapper { event } => {
+                format!("{event}: 仍在使用 throttled-stop wrapper")
+            }
+            Self::FieldMismatch { event, field } => {
+                format!("{event}: {field} 与当前版本不一致")
+            }
+        }
+    }
+}
+
+fn detect_hook_drift(settings: &Value, expected: &Value) -> Vec<HookDrift> {
+    let Some(expected_events) = expected.as_object() else {
+        return Vec::new();
+    };
+    let mut drift = Vec::new();
+
+    for event_name in expected_events.keys() {
+        let Some(wanted) = expected_hook(expected, event_name) else {
+            continue;
+        };
+        let Some(wanted_command) = wanted.get("command").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(subcommand) = subcommand_of(wanted_command) else {
+            continue;
+        };
+        let installed = hook_values(settings, event_name);
+        let legacy_present = event_name == "Stop"
+            && installed.iter().any(|hook| {
+                hook.get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_legacy_stop_wrapper)
+            });
+        if legacy_present {
+            drift.push(HookDrift::LegacyWrapper {
+                event: event_name.clone(),
+            });
+        }
+        let ours = installed.iter().copied().find(|hook| {
+            hook.get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|command| is_ours_for(command, subcommand))
+        });
+
+        let Some(actual) = ours else {
+            if !legacy_present {
+                drift.push(HookDrift::Missing {
+                    event: event_name.clone(),
+                });
+            }
+            continue;
+        };
+
+        for field in HOOK_FIELDS {
+            if let Some(wanted_value) = wanted.get(*field) {
+                if actual.get(*field) != Some(wanted_value) {
+                    drift.push(HookDrift::FieldMismatch {
+                        event: event_name.clone(),
+                        field: (*field).to_string(),
+                    });
                 }
             }
         }
     }
-    updated
+
+    drift
 }
 
-/// Install hooks to ~/.claude/settings.json
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RefreshResult {
+    refreshed: bool,
+    replaced_legacy: bool,
+}
+
+/// Refresh matching hook fields in place while retaining user-added fields.
+fn refresh_our_hook(existing: &mut [Value], subcommand: &str, wanted: &Value) -> RefreshResult {
+    let mut result = RefreshResult::default();
+    let Some(wanted_object) = wanted.as_object() else {
+        return result;
+    };
+    let already_has_ours = existing.iter().any(|group| {
+        group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|hook| {
+                hook.get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|command| is_ours_for(command, subcommand))
+            })
+    });
+
+    for group in existing {
+        let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let mut index = 0;
+        while index < hooks.len() {
+            let command = hooks[index]
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let ours = is_ours_for(command, subcommand);
+            let legacy = subcommand == "hook-stop" && is_legacy_stop_wrapper(command);
+            if already_has_ours && legacy {
+                hooks.remove(index);
+                result.replaced_legacy = true;
+                continue;
+            }
+            if ours || legacy {
+                if let Some(object) = hooks[index].as_object_mut() {
+                    for (key, value) in wanted_object {
+                        object.insert(key.clone(), value.clone());
+                    }
+                    result.refreshed |= ours;
+                    result.replaced_legacy |= legacy;
+                }
+            }
+            index += 1;
+        }
+    }
+
+    result
+}
+
+/// Install hooks to ~/.claude/settings.json.
 pub fn handle_hooks_install() -> Result<()> {
     let settings_path = claude_settings_path()?;
 
     println!("{}", "Installing Claude Code hooks...".cyan().bold());
 
-    // Read existing settings or create new
     let mut settings: Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content).unwrap_or(json!({}))
+        let content = std::fs::read_to_string(&settings_path)
+            .with_context(|| format!("Failed to read {}", settings_path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", settings_path.display()))?
     } else {
         json!({})
     };
 
-    // Ensure hooks object exists
     if settings.get("hooks").is_none() {
         settings["hooks"] = json!({});
     }
@@ -192,60 +403,55 @@ pub fn handle_hooks_install() -> Result<()> {
     let hooks_to_add = get_hooks_config();
     let hooks_obj = settings
         .get_mut("hooks")
-        .and_then(|v| v.as_object_mut())
+        .and_then(Value::as_object_mut)
         .context("Failed to access hooks object")?;
 
-    // Merge each hook type
-    for (event_name, new_hooks) in hooks_to_add.as_object().unwrap() {
-        let new_hooks_array = new_hooks.as_array().unwrap();
+    for (event_name, new_hooks) in hooks_to_add
+        .as_object()
+        .context("Expected hook configuration object")?
+    {
+        let new_hooks_array = new_hooks
+            .as_array()
+            .context("Expected hook configuration array")?;
+        let wanted = expected_hook(&hooks_to_add, event_name)
+            .context("Expected hook configuration entry")?;
+        let wanted_command = wanted
+            .get("command")
+            .and_then(Value::as_str)
+            .context("Expected hook command")?;
+        let subcommand = subcommand_of(wanted_command).context("Expected hook subcommand")?;
 
         if let Some(existing) = hooks_obj.get_mut(event_name) {
-            // The command we want in settings.json for this event (absolute path).
-            let new_command = new_hooks_array
-                .first()
-                .and_then(|g| g.get("hooks"))
-                .and_then(|h| h.as_array())
-                .and_then(|hooks| hooks.first())
-                .and_then(|h| h.get("command"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
-            // The `hook-*` subcommand token used for precise matching. Found by
-            // prefix rather than positional index so it survives a quoted,
-            // space-containing absolute path (e.g. `"/a b/ccs" hook-stop`).
-            let subcommand = new_command
-                .split_whitespace()
-                .find(|t| t.starts_with("hook-"))
-                .unwrap_or("");
-
-            if let Some(existing_array) = existing.as_array_mut() {
-                // Self-heal: if our hook is already there, refresh its command to
-                // the absolute path instead of skipping (handles devices set up
-                // with an older bare `ccs hook-*`). Custom wrappers untouched.
-                if update_our_hook_command(existing_array, subcommand, new_command) {
-                    println!(
-                        "  {} {} hook refreshed (absolute path)",
-                        "↻".cyan(),
-                        event_name
-                    );
-                    continue;
-                }
-
-                // Not present yet — append our hook to the existing array.
-                for hook in new_hooks_array {
-                    existing_array.push(hook.clone());
-                }
+            let existing_array = existing
+                .as_array_mut()
+                .with_context(|| format!("{event_name} hooks must be an array"))?;
+            let refresh = refresh_our_hook(existing_array, subcommand, wanted);
+            existing_array.retain(|group| {
+                group
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .is_none_or(|hooks| !hooks.is_empty())
+            });
+            if refresh.replaced_legacy {
+                println!("  {} {} legacy wrapper replaced", "↻".cyan(), event_name);
+            } else if refresh.refreshed {
+                println!("  {} {} hook refreshed", "↻".cyan(), event_name);
+            } else {
+                existing_array.extend(new_hooks_array.iter().cloned());
                 println!("  {} {} hook added", "✓".green(), event_name);
             }
         } else {
-            // Create new hook array
             hooks_obj.insert(event_name.clone(), new_hooks.clone());
             println!("  {} {} hook installed", "✓".green(), event_name);
         }
     }
 
-    // Write back
-    std::fs::create_dir_all(settings_path.parent().unwrap())?;
-    std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+    std::fs::create_dir_all(
+        settings_path
+            .parent()
+            .context("Claude settings path has no parent")?,
+    )?;
+    persist_json_pretty_atomic(&settings_path, &settings)?;
 
     println!(
         "\n{} Hooks installed to {}",
@@ -256,7 +462,7 @@ pub fn handle_hooks_install() -> Result<()> {
     Ok(())
 }
 
-/// Uninstall hooks from ~/.claude/settings.json
+/// Uninstall hooks from ~/.claude/settings.json.
 pub fn handle_hooks_uninstall() -> Result<()> {
     let settings_path = claude_settings_path()?;
 
@@ -272,152 +478,129 @@ pub fn handle_hooks_uninstall() -> Result<()> {
 
     let content = std::fs::read_to_string(&settings_path)?;
     let mut settings: Value = serde_json::from_str(&content)?;
+    let mut removed_count = 0;
 
-    if let Some(hooks_obj) = settings.get_mut("hooks").and_then(|v| v.as_object_mut()) {
-        let mut removed_count = 0;
-
-        // Remove our hooks from each event type (including legacy SessionEnd)
-        for event_name in &["SessionStart", "Stop", "SessionEnd", "UserPromptSubmit"] {
-            if let Some(hooks_array) = hooks_obj
-                .get_mut(*event_name)
-                .and_then(|v| v.as_array_mut())
-            {
-                let original_len = hooks_array.len();
-
-                // Filter out our hooks
-                hooks_array.retain(|group| {
-                    !group
+    if let Some(hooks_obj) = settings.get_mut("hooks").and_then(Value::as_object_mut) {
+        for event_name in ["SessionStart", "Stop", "SessionEnd", "UserPromptSubmit"] {
+            let mut remove_event = false;
+            if let Some(groups) = hooks_obj.get_mut(event_name).and_then(Value::as_array_mut) {
+                for group in groups.iter_mut() {
+                    if let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+                        let before = hooks.len();
+                        hooks.retain(|hook| {
+                            !hook
+                                .get("command")
+                                .and_then(Value::as_str)
+                                .is_some_and(is_our_hook_command)
+                        });
+                        removed_count += before - hooks.len();
+                    }
+                }
+                groups.retain(|group| {
+                    group
                         .get("hooks")
-                        .and_then(|h| h.as_array())
-                        .map(|hooks| {
-                            hooks.iter().any(|hook| {
-                                hook.get("command")
-                                    .and_then(|c| c.as_str())
-                                    .map(is_our_hook_command)
-                                    .unwrap_or(false)
-                            })
-                        })
-                        .unwrap_or(false)
+                        .and_then(Value::as_array)
+                        .is_none_or(|hooks| !hooks.is_empty())
                 });
-
-                if hooks_array.len() < original_len {
-                    removed_count += original_len - hooks_array.len();
-                    println!("  {} Removed {} hook", "✓".green(), event_name);
-                }
-
-                // Remove empty arrays
-                if hooks_array.is_empty() {
-                    hooks_obj.remove(*event_name);
-                }
+                remove_event = groups.is_empty();
             }
-        }
-
-        if removed_count == 0 {
-            println!(
-                "{}",
-                format!("No {} hooks found to remove.", BINARY_NAME).yellow()
-            );
-        } else {
-            // Write back
-            std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
-            println!("\n{} {} hook(s) removed", "✓".green(), removed_count);
+            if remove_event {
+                hooks_obj.remove(event_name);
+            }
         }
     } else {
         println!("{}", "No hooks configured, nothing to uninstall.".yellow());
+        return Ok(());
+    }
+
+    if removed_count == 0 {
+        println!(
+            "{}",
+            format!("No {} hooks found to remove.", BINARY_NAME).yellow()
+        );
+    } else {
+        persist_json_pretty_atomic(&settings_path, &settings)?;
+        println!("\n{} {} hook(s) removed", "✓".green(), removed_count);
     }
 
     Ok(())
 }
 
-/// Show current hooks configuration status
+fn read_hook_settings() -> Result<Value> {
+    let settings_path = claude_settings_path()?;
+    if !settings_path.exists() {
+        return Ok(json!({}));
+    }
+    let content = std::fs::read_to_string(&settings_path)?;
+    serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse {}", settings_path.display()))
+}
+
+/// Show current hooks configuration status.
 pub fn handle_hooks_show() -> Result<()> {
     let settings_path = claude_settings_path()?;
+    let settings = read_hook_settings()?;
+    let expected = get_hooks_config();
+    let drift = detect_hook_drift(&settings, &expected);
 
     println!("{}", "Claude Code Hooks Status".cyan().bold());
     println!("Settings file: {}", settings_path.display());
     println!();
 
-    if !settings_path.exists() {
-        println!("{}", "No settings file found.".yellow());
-        println!();
-        println!(
-            "Run '{}' to install hooks.",
-            format!("{} hooks install", BINARY_NAME).cyan()
-        );
-        return Ok(());
-    }
-
-    let content = std::fs::read_to_string(&settings_path)?;
-    let settings: Value = serde_json::from_str(&content)?;
-
-    let hooks_installed = if let Some(hooks_obj) = settings.get("hooks").and_then(|v| v.as_object())
-    {
-        let mut found = Vec::new();
-
-        // Check SessionStart
-        if let Some(hooks_array) = hooks_obj.get("SessionStart").and_then(|v| v.as_array()) {
-            if contains_our_hook(hooks_array, "hook-session-start") {
-                found.push("SessionStart");
-            }
-        }
-
-        // Check Stop
-        if let Some(hooks_array) = hooks_obj.get("Stop").and_then(|v| v.as_array()) {
-            if contains_our_hook(hooks_array, "hook-stop") {
-                found.push("Stop");
-            }
-        }
-
-        // Check UserPromptSubmit
-        if let Some(hooks_array) = hooks_obj.get("UserPromptSubmit").and_then(|v| v.as_array()) {
-            if contains_our_hook(hooks_array, "hook-new-project-check") {
-                found.push("UserPromptSubmit");
-            }
-        }
-
-        found
-    } else {
-        Vec::new()
-    };
-
-    if hooks_installed.is_empty() {
-        println!(
-            "{}",
-            format!("{} hooks: NOT installed", BINARY_NAME).yellow()
-        );
-        println!();
-        println!(
-            "Run '{}' to install hooks.",
-            format!("{} hooks install", BINARY_NAME).cyan()
-        );
-    } else {
+    if drift.is_empty() {
         println!("{}", format!("{} hooks: INSTALLED", BINARY_NAME).green());
         println!();
         println!("Installed hooks:");
-        for hook in &hooks_installed {
-            let description = match *hook {
-                "SessionStart" => "Pull on startup (IDE support)",
-                "Stop" => "Push after each response",
-                "UserPromptSubmit" => "New project detection",
-                _ => "",
-            };
-            println!("  {} {} ({})", "•".green(), hook.cyan(), description);
+        println!(
+            "  {} {} (Pull on startup)",
+            "•".green(),
+            "SessionStart".cyan()
+        );
+        println!("  {} {} (Background push)", "•".green(), "Stop".cyan());
+        println!(
+            "  {} {} (New project detection)",
+            "•".green(),
+            "UserPromptSubmit".cyan()
+        );
+    } else {
+        println!("{}", format!("{} hooks: NEED UPDATE", BINARY_NAME).yellow());
+        println!();
+        println!("Drift:");
+        for item in &drift {
+            println!("  {} {}", "•".yellow(), item.description());
         }
-
-        if hooks_installed.len() < 3 {
-            println!();
-            println!(
-                "{}",
-                format!(
-                    "Note: Some hooks are missing. Run '{} hooks install' to reinstall.",
-                    BINARY_NAME
-                )
-                .yellow()
-            );
-        }
+        println!();
+        println!(
+            "Run '{}' to update hooks.",
+            format!("{} hooks install", BINARY_NAME).cyan()
+        );
     }
 
     Ok(())
+}
+
+/// Check whether installed hooks match this ccs version.
+pub fn handle_hooks_check(quiet: bool) -> Result<()> {
+    let drift = detect_hook_drift(&read_hook_settings()?, &get_hooks_config());
+    if drift.is_empty() {
+        return Ok(());
+    }
+
+    if quiet {
+        eprintln!(
+            "hook 配置与 v{} 不一致，运行 `{} hooks install` 更新",
+            env!("CARGO_PKG_VERSION"),
+            BINARY_NAME
+        );
+    } else {
+        eprintln!("检测到 hook 配置漂移：");
+        for item in &drift {
+            eprintln!("  - {}", item.description());
+        }
+        eprintln!("运行 `{} hooks install` 更新", BINARY_NAME);
+    }
+
+    Err(anyhow::anyhow!("hook configuration drift detected"))
 }
 
 /// Handle the hook-new-project-check command
@@ -480,57 +663,260 @@ pub fn handle_new_project_check() -> Result<()> {
     Ok(())
 }
 
-/// Handle the hook-stop command
-/// This is called by the Stop hook after each AI response to push history
-/// Reads JSON from stdin
-pub fn handle_stop() -> Result<()> {
-    append_hook_debug("Stop hook executed");
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PushHookState {
+    #[serde(default)]
+    consecutive_failures: u32,
+    #[serde(default)]
+    alerted_failures: u32,
+    #[serde(default)]
+    last_success_unix: Option<u64>,
+    #[serde(default)]
+    last_failure_unix: Option<u64>,
+    #[serde(default)]
+    last_error: Option<String>,
+}
 
-    // Read hook input from stdin (required by Claude Code hooks)
-    let _input: Value = serde_json::from_reader(std::io::stdin()).unwrap_or(json!({}));
-
-    // Execute push quietly after each response.
-    // Spawn via current_exe() so it works even when the hook environment
-    // PATH does not include the cargo bin directory.
-    let push_result = spawn_ccs_subcommand("push", &["--quiet"]);
-
-    match &push_result {
-        Ok(status) if status.success() => {
-            append_hook_debug(&format!("Stop push completed: exit code {status}"));
+impl PushHookState {
+    fn load() -> Self {
+        let Ok(path) = ConfigManager::push_hook_state_path() else {
+            return Self::default();
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Self::default();
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(state) => state,
+            Err(error) => {
+                append_hook_debug(&format!(
+                    "push worker state is invalid, using defaults: {error}"
+                ));
+                Self::default()
+            }
         }
-        Ok(status) => {
-            append_hook_debug(&format!("Stop push FAILED: exit code {status}"));
+    }
+
+    fn save(&self) -> Result<()> {
+        persist_json_atomic(&ConfigManager::push_hook_state_path()?, self)
+    }
+
+    fn record_success(&mut self, now: u64) {
+        self.consecutive_failures = 0;
+        self.alerted_failures = 0;
+        self.last_success_unix = Some(now);
+        self.last_failure_unix = None;
+        self.last_error = None;
+    }
+
+    fn record_failure(&mut self, now: u64, error: &anyhow::Error) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.last_failure_unix = Some(now);
+        self.last_error = Some(format!("{error:#}"));
+    }
+}
+
+fn pending_alert(state: &PushHookState) -> bool {
+    state.consecutive_failures >= PUSH_HOOK_ALERT_THRESHOLD
+        && state.consecutive_failures > state.alerted_failures
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn throttle_active(stamp_path: &Path, now: SystemTime) -> bool {
+    let Ok(metadata) = std::fs::metadata(stamp_path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    now.duration_since(modified).unwrap_or_default().as_secs() < PUSH_HOOK_THROTTLE_SECS
+}
+
+fn touch_stamp() -> Result<()> {
+    let path = ConfigManager::push_hook_stamp_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .with_context(|| format!("Failed to touch {}", path.display()))?;
+    Ok(())
+}
+
+fn record_worker_failure(error: anyhow::Error) {
+    append_hook_debug(&format!("Stop worker FAILED: {error:#}"));
+    let mut state = PushHookState::load();
+    state.record_failure(unix_now(), &error);
+    if let Err(save_error) = state.save() {
+        append_hook_debug(&format!(
+            "failed to save push worker failure state: {save_error:#}"
+        ));
+    }
+}
+
+fn run_stop_worker() {
+    let lock_path = match ConfigManager::push_hook_lock_path() {
+        Ok(path) => path,
+        Err(error) => {
+            append_hook_debug(&format!("Stop worker lock path unavailable: {error:#}"));
+            return;
+        }
+    };
+    let _worker_lock = match FileLock::try_acquire(&lock_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            append_hook_debug("Stop worker skipped: another worker holds push-hook.lock");
+            return;
         }
         Err(error) => {
-            append_hook_debug(&format!("Stop push failed to execute: {error}"));
+            append_hook_debug(&format!("Stop worker lock unavailable: {error:#}"));
+            return;
         }
+    };
+
+    let stamp_path = match ConfigManager::push_hook_stamp_path() {
+        Ok(path) => path,
+        Err(error) => {
+            record_worker_failure(error);
+            return;
+        }
+    };
+    if throttle_active(&stamp_path, SystemTime::now()) {
+        append_hook_debug("Stop worker skipped: throttle active");
+        return;
     }
 
-    // Also sync config if enabled. config_sync is a direct function call (not a
-    // spawned subprocess), so it is unaffected by PATH issues that can break
-    // the push above — keep running it regardless of push outcome.
+    let sync_state = match SyncState::load() {
+        Ok(state) => state,
+        Err(error) => {
+            record_worker_failure(error);
+            return;
+        }
+    };
+    let _repo_lock = match RepoLock::acquire(&sync_state.sync_repo_path) {
+        Ok(RepoLockOutcome::Acquired(lock)) => lock,
+        Ok(RepoLockOutcome::Busy) => {
+            append_hook_debug("Stop worker skipped: sync repository is busy");
+            return;
+        }
+        Err(error) => {
+            record_worker_failure(error);
+            return;
+        }
+    };
+
+    let push_result = crate::sync::push_history(
+        None,
+        true,
+        None,
+        false,
+        true,
+        false,
+        false,
+        VerbosityLevel::Quiet,
+    );
+    if let Err(error) = push_result {
+        record_worker_failure(error);
+        return;
+    }
+
     if let Ok(filter) = crate::filter::FilterConfig::load() {
         if filter.config_sync.enabled {
-            let _ = super::config_sync::handle_config_push(&filter.config_sync);
+            match super::config_sync::handle_config_push(&filter.config_sync) {
+                Ok(()) => append_hook_debug("Stop worker config push completed"),
+                Err(error) => append_hook_debug(&format!(
+                    "Stop worker config push failed (history push kept): {error:#}"
+                )),
+            }
         }
     }
 
-    // Propagate push failure so the throttled-stop.sh wrapper sees a non-zero
-    // exit code and does NOT advance the throttle timestamp — otherwise the
-    // next 5 minutes of Stop hooks would be silently skipped despite the push
-    // never succeeding. `ccs push` returns Ok (exit 0) when there is nothing to
-    // push, so this only fires on real failure.
-    match push_result {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => {
-            log::warn!("ccs push exited with {}", status);
-            Err(anyhow::anyhow!("ccs push exited with {}", status))
-        }
-        Err(e) => {
-            log::warn!("ccs push failed to execute: {}", e);
-            Err(anyhow::anyhow!("ccs push failed to execute: {}", e))
-        }
+    let mut state = PushHookState::load();
+    state.record_success(unix_now());
+    if let Err(error) = state.save() {
+        record_worker_failure(error.context("failed to save push worker success state"));
+        return;
     }
+    if let Err(error) = touch_stamp() {
+        record_worker_failure(error);
+        return;
+    }
+    append_hook_debug("Stop worker completed successfully");
+}
+
+fn report_pending_alert() -> Result<()> {
+    let lock_path = match ConfigManager::push_hook_lock_path() {
+        Ok(path) => path,
+        Err(error) => {
+            append_hook_debug(&format!(
+                "Stop alert check skipped: lock path unavailable: {error:#}"
+            ));
+            return Ok(());
+        }
+    };
+    let _alert_lock = match FileLock::try_acquire(&lock_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            append_hook_debug("Stop alert check skipped: worker holds push-hook.lock");
+            return Ok(());
+        }
+        Err(error) => {
+            append_hook_debug(&format!(
+                "Stop alert check skipped: lock unavailable: {error:#}"
+            ));
+            return Ok(());
+        }
+    };
+
+    let mut state = PushHookState::load();
+    if !pending_alert(&state) {
+        return Ok(());
+    }
+    let failures = state.consecutive_failures;
+    state.alerted_failures = failures;
+    state.save()?;
+    let debug_log = ConfigManager::config_dir()?.join("hook-debug.log");
+    Err(anyhow::anyhow!(
+        "Stop 后台推送已连续失败 {failures} 次。查看详情：tail -n 20 '{}'",
+        debug_log.display()
+    ))
+}
+
+/// Handle the hook-stop command.
+///
+/// The foreground invocation only checks alerts/throttling and spawns a detached
+/// worker. The worker owns both the hook lock and repository lock, so the hook
+/// harness can return immediately without leaving lock lifetime ambiguous.
+pub fn handle_stop(worker: bool) -> Result<()> {
+    if worker {
+        run_stop_worker();
+        return Ok(());
+    }
+
+    let _input: Value = serde_json::from_reader(std::io::stdin()).unwrap_or(json!({}));
+    append_hook_debug("Stop hook executed");
+
+    report_pending_alert()?;
+
+    let stamp_path = ConfigManager::push_hook_stamp_path()?;
+    if throttle_active(&stamp_path, SystemTime::now()) {
+        append_hook_debug("Stop hook skipped: throttle active");
+        return Ok(());
+    }
+
+    match spawn_detached_worker() {
+        Ok(child) => append_hook_debug(&format!("Stop worker spawned: pid {}", child.id())),
+        Err(error) => append_hook_debug(&format!("Stop worker spawn failed: {error}")),
+    }
+    Ok(())
 }
 
 /// Debounce interval for SessionStart pull (in seconds)
@@ -538,6 +924,12 @@ pub fn handle_stop() -> Result<()> {
 const SESSION_START_DEBOUNCE_SECS: u64 = 300; // 5 minutes
 
 /// Count running Claude Code processes.
+///
+/// The unix branch matches `native-binary/claude`, which only covers the native
+/// install layout. An npm-global install runs from
+/// `@anthropic-ai/claude-code/bin/claude.exe` and matches nothing, so this
+/// returns 0 there and `is_first_instance` in `handle_session_start` is always
+/// true. Widen the pattern before relying on the count for anything.
 #[cfg(unix)]
 fn count_claude_processes() -> usize {
     let output = std::process::Command::new("sh")
@@ -580,10 +972,14 @@ fn count_claude_processes() -> usize {
 /// This is called by the SessionStart hook to pull latest history
 /// Reads JSON from stdin, outputs JSON to stdout
 ///
-/// Uses triple-condition detection to only pull on first startup:
-/// 1. Process count = 1 (no other Claude instances)
+/// Pulls only on first startup, gated on three conditions:
+/// 1. Process count <= 1 (no other Claude instances) — see
+///    `count_claude_processes`: inert on npm-global installs, where it counts 0
+///    and this condition always passes
 /// 2. source = "startup" (not resume/compact)
 /// 3. Debounce not active (extra protection)
+///
+/// So in practice conditions 2 and 3 are what gate the pull.
 pub fn handle_session_start() -> Result<()> {
     // Read hook input from stdin (required by Claude Code hooks)
     let input: Value = serde_json::from_reader(std::io::stdin()).unwrap_or(json!({}));
@@ -681,118 +1077,249 @@ pub fn handle_session_start() -> Result<()> {
     Ok(())
 }
 
-/// Check if hooks are installed
+/// Check if hooks are installed and match this ccs version.
 pub fn are_hooks_installed() -> Result<bool> {
-    let settings_path = claude_settings_path()?;
-
-    if !settings_path.exists() {
-        return Ok(false);
-    }
-
-    let content = std::fs::read_to_string(&settings_path)?;
-    let settings: Value = serde_json::from_str(&content)?;
-
-    if let Some(hooks_obj) = settings.get("hooks").and_then(|v| v.as_object()) {
-        // Check all required hooks
-        let has_session_start = hooks_obj
-            .get("SessionStart")
-            .and_then(|v| v.as_array())
-            .map(|arr| contains_our_hook(arr, "hook-session-start"))
-            .unwrap_or(false);
-
-        let has_stop = hooks_obj
-            .get("Stop")
-            .and_then(|v| v.as_array())
-            .map(|arr| contains_our_hook(arr, "hook-stop"))
-            .unwrap_or(false);
-
-        let has_prompt_submit = hooks_obj
-            .get("UserPromptSubmit")
-            .and_then(|v| v.as_array())
-            .map(|arr| contains_our_hook(arr, "hook-new-project-check"))
-            .unwrap_or(false);
-
-        Ok(has_session_start && has_stop && has_prompt_submit)
-    } else {
-        Ok(false)
-    }
+    Ok(detect_hook_drift(&read_hook_settings()?, &get_hooks_config()).is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use std::fs::File;
+    use std::time::Duration;
+    use tempfile::tempdir;
 
-    /// `spawn_ccs_subcommand` must never panic and always return a Result.
-    /// In tests, `current_exe()` points at the test binary, which treats an
-    /// unknown subcommand as a test filter and exits 0 — so we cannot assert a
-    /// specific exit status here. The real verification happens by triggering
-    /// the Stop hook and reading hook-debug.log.
-    #[test]
-    fn spawn_ccs_subcommand_returns_result_without_panic() {
-        let _ = spawn_ccs_subcommand("__definitely_not_a_subcommand__", &[]);
+    struct EnvGuard {
+        original: Option<std::ffi::OsString>,
     }
 
-    /// The command written to settings.json must be an absolute, double-quoted
-    /// path plus the subcommand — never a bare `ccs` (which fails in the hook
-    /// shell whose PATH excludes the cargo bin dir).
+    impl EnvGuard {
+        fn set(path: &Path) -> Self {
+            let original = std::env::var_os(crate::config::CONFIG_DIR_ENV);
+            std::env::set_var(crate::config::CONFIG_DIR_ENV, path);
+            Self { original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+            }
+        }
+    }
+
+    fn expected() -> Value {
+        let mut expected = get_hooks_config();
+        for (event, subcommand) in [
+            ("SessionStart", "hook-session-start"),
+            ("Stop", "hook-stop"),
+            ("UserPromptSubmit", "hook-new-project-check"),
+        ] {
+            expected[event][0]["hooks"][0]["command"] =
+                json!(format!("\"/test/bin/ccs\" {subcommand}"));
+        }
+        expected
+    }
+
+    fn expected_settings() -> Value {
+        json!({ "hooks": expected() })
+    }
+
     #[test]
     fn hook_command_is_quoted_absolute_path() {
         let cmd = hook_command("hook-stop");
         assert!(cmd.starts_with('"'), "path must be quoted: {cmd}");
         assert!(cmd.ends_with(" hook-stop"), "must carry subcommand: {cmd}");
-        // The quoted segment resolves to the running test binary's real path,
-        // which is absolute on every platform.
-        let quoted = cmd
-            .split('"')
-            .nth(1)
-            .expect("command should contain a quoted path");
+        let quoted = cmd.split('"').nth(1).unwrap();
         assert!(
-            std::path::Path::new(quoted).is_absolute(),
+            Path::new(quoted).is_absolute(),
             "path should be absolute: {quoted}"
         );
     }
 
-    /// Self-heal: an existing bare `ccs hook-stop` is rewritten to the new
-    /// absolute command; a matching hook returns true.
     #[test]
-    fn update_our_hook_command_refreshes_bare_command() {
-        let mut arr = vec![json!({
-            "hooks": [{ "type": "command", "command": "ccs hook-stop", "timeout": 60 }]
-        })];
-        let updated = update_our_hook_command(&mut arr, "hook-stop", "\"/abs/ccs\" hook-stop");
-        assert!(updated);
-        assert_eq!(arr[0]["hooks"][0]["command"], "\"/abs/ccs\" hook-stop");
-
-        // Idempotent: a second pass with the same target keeps it stable.
-        let again = update_our_hook_command(&mut arr, "hook-stop", "\"/abs/ccs\" hook-stop");
-        assert!(again);
-        assert_eq!(arr[0]["hooks"][0]["command"], "\"/abs/ccs\" hook-stop");
+    fn hook_ownership_requires_exact_executable_basename() {
+        assert!(is_our_hook_command("\"/Users/x/.local/bin/ccs\" hook-stop"));
+        assert!(is_our_hook_command(
+            "C:\\Users\\x\\claude-code-sync.exe hook-session-start"
+        ));
+        assert!(!is_our_hook_command("/usr/local/bin/ccs-monitor hook-stop"));
+        assert!(!is_our_hook_command("python ccs hook-stop"));
+        assert!(!is_our_hook_command("ccs --version"));
     }
 
-    /// Custom user wrappers (no marker, no subcommand) must never be touched.
     #[test]
-    fn update_our_hook_command_ignores_custom_wrapper() {
-        let mut arr = vec![json!({
-            "hooks": [{ "type": "command", "command": "~/.claude/hooks/throttled-stop.sh", "timeout": 60 }]
-        })];
-        let updated = update_our_hook_command(&mut arr, "hook-stop", "\"/abs/ccs\" hook-stop");
-        assert!(!updated, "custom wrapper should not match");
+    fn legacy_wrapper_requires_exact_supported_basename() {
+        for command in [
+            "throttled-stop",
+            "~/.claude/hooks/throttled-stop.sh",
+            "C:\\hooks\\throttled-stop.bat",
+            "'C:\\hook dir\\throttled-stop.ps1'",
+        ] {
+            assert!(is_legacy_stop_wrapper(command), "must match {command}");
+        }
+        assert!(!is_legacy_stop_wrapper(
+            "python my-throttled-stop-notify.py"
+        ));
+        assert!(!is_legacy_stop_wrapper("throttled-stop.py"));
+    }
+
+    #[test]
+    fn drift_reports_all_missing_hooks() {
+        let drift = detect_hook_drift(&json!({}), &expected());
+        assert_eq!(drift.len(), 3);
+        assert!(drift
+            .iter()
+            .all(|item| matches!(item, HookDrift::Missing { .. })));
+    }
+
+    #[test]
+    fn drift_reports_stop_timeout_mismatch() {
+        let mut settings = expected_settings();
+        settings["hooks"]["Stop"][0]["hooks"][0]["timeout"] = json!(60);
         assert_eq!(
-            arr[0]["hooks"][0]["command"],
-            "~/.claude/hooks/throttled-stop.sh"
+            detect_hook_drift(&settings, &expected()),
+            vec![HookDrift::FieldMismatch {
+                event: "Stop".to_string(),
+                field: "timeout".to_string(),
+            }]
         );
     }
 
-    /// The `hook-*` subcommand token must be recoverable from a quoted,
-    /// space-containing absolute path (the fragile positional `nth(1)` failed
-    /// here). Mirrors the extraction in `handle_hooks_install`.
     #[test]
-    fn subcommand_extracted_from_quoted_spaced_path() {
-        let cmd = "\"/a b/ccs\" hook-session-start";
-        let sub = cmd
-            .split_whitespace()
-            .find(|t| t.starts_with("hook-"))
-            .unwrap_or("");
-        assert_eq!(sub, "hook-session-start");
+    fn drift_reports_legacy_stop_wrapper() {
+        let mut settings = expected_settings();
+        settings["hooks"]["Stop"][0]["hooks"][0]["command"] =
+            json!("~/.claude/hooks/throttled-stop.sh");
+        assert_eq!(
+            detect_hook_drift(&settings, &expected()),
+            vec![HookDrift::LegacyWrapper {
+                event: "Stop".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn unrelated_stop_hook_is_not_classified_as_legacy() {
+        let mut settings = expected_settings();
+        settings["hooks"]["Stop"] = json!([{
+            "hooks": [{ "type": "command", "command": "python notify-stop.py", "timeout": 10 }]
+        }]);
+        let drift = detect_hook_drift(&settings, &expected());
+        assert_eq!(
+            drift,
+            vec![HookDrift::Missing {
+                event: "Stop".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn extra_async_field_does_not_drift() {
+        let mut settings = expected_settings();
+        settings["hooks"]["Stop"][0]["hooks"][0]["async"] = json!(true);
+        assert!(detect_hook_drift(&settings, &expected()).is_empty());
+    }
+
+    #[test]
+    fn refresh_replaces_legacy_and_preserves_extra_fields() {
+        let mut groups = vec![json!({
+            "hooks": [{
+                "type": "command",
+                "command": "~/.claude/hooks/throttled-stop.sh",
+                "timeout": 60,
+                "async": true
+            }]
+        })];
+        let wanted = expected_hook(&expected(), "Stop").unwrap().clone();
+        let result = refresh_our_hook(&mut groups, "hook-stop", &wanted);
+        assert_eq!(
+            result,
+            RefreshResult {
+                refreshed: false,
+                replaced_legacy: true,
+            }
+        );
+        assert_eq!(groups[0]["hooks"][0]["command"], wanted["command"]);
+        assert_eq!(groups[0]["hooks"][0]["timeout"], 10);
+        assert_eq!(groups[0]["hooks"][0]["async"], true);
+    }
+
+    #[test]
+    fn refresh_removes_legacy_when_current_hook_already_exists() {
+        let wanted = expected_hook(&expected(), "Stop").unwrap().clone();
+        let mut groups = vec![
+            json!({ "hooks": [wanted.clone()] }),
+            json!({ "hooks": [{ "type": "command", "command": "throttled-stop.sh", "timeout": 60 }] }),
+        ];
+        let result = refresh_our_hook(&mut groups, "hook-stop", &wanted);
+        assert!(result.refreshed);
+        assert!(result.replaced_legacy);
+        assert!(groups[1]["hooks"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn refresh_does_not_touch_unrelated_wrapper() {
+        let mut groups = vec![json!({
+            "hooks": [{ "type": "command", "command": "python notify-stop.py", "timeout": 60 }]
+        })];
+        let wanted = expected_hook(&expected(), "Stop").unwrap().clone();
+        let original = groups.clone();
+        assert_eq!(
+            refresh_our_hook(&mut groups, "hook-stop", &wanted),
+            RefreshResult::default()
+        );
+        assert_eq!(groups, original);
+    }
+
+    #[test]
+    fn pending_alert_obeys_threshold_and_deduplication() {
+        let state = |failures, alerted| PushHookState {
+            consecutive_failures: failures,
+            alerted_failures: alerted,
+            ..PushHookState::default()
+        };
+        assert!(!pending_alert(&state(2, 0)));
+        assert!(pending_alert(&state(3, 0)));
+        assert!(!pending_alert(&state(3, 3)));
+        assert!(pending_alert(&state(4, 3)));
+    }
+
+    #[test]
+    #[serial]
+    fn push_hook_state_round_trip_and_corrupt_fallback() {
+        let dir = tempdir().unwrap();
+        let _guard = EnvGuard::set(dir.path());
+        let state = PushHookState {
+            consecutive_failures: 4,
+            alerted_failures: 3,
+            last_success_unix: Some(1),
+            last_failure_unix: Some(2),
+            last_error: Some("boom".to_string()),
+        };
+        state.save().unwrap();
+        assert_eq!(PushHookState::load(), state);
+
+        std::fs::write(ConfigManager::push_hook_state_path().unwrap(), b"not json").unwrap();
+        assert_eq!(PushHookState::load(), PushHookState::default());
+    }
+
+    #[test]
+    fn throttle_active_handles_missing_fresh_and_old_stamps() {
+        let dir = tempdir().unwrap();
+        let stamp = dir.path().join("stamp");
+        let now = SystemTime::now();
+        assert!(!throttle_active(&stamp, now));
+
+        let file = File::create(&stamp).unwrap();
+        file.set_modified(now).unwrap();
+        assert!(throttle_active(&stamp, now));
+
+        file.set_modified(now - Duration::from_secs(PUSH_HOOK_THROTTLE_SECS + 1))
+            .unwrap();
+        assert!(!throttle_active(&stamp, now));
     }
 }

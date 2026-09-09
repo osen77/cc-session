@@ -199,7 +199,7 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
 }
 
 /// Download and replace the current binary
-fn download_and_replace(version: &str) -> Result<()> {
+fn download_and_replace(version: &str) -> Result<std::path::PathBuf> {
     let current_exe = std::env::current_exe().context("Failed to get current executable path")?;
     let asset_name = get_asset_name()?;
 
@@ -329,7 +329,35 @@ fn download_and_replace(version: &str) -> Result<()> {
     // Cleanup temp directory
     let _ = fs::remove_dir_all(&temp_dir);
 
-    Ok(())
+    Ok(current_exe)
+}
+
+fn check_hook_drift_with(executable: &Path) {
+    match Command::new(executable)
+        .args(["hooks", "check", "--quiet"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(_) => print_hook_drift_notification(),
+        Err(error) => log::warn!(
+            "failed to check hook configuration with updated executable {}: {}",
+            executable.display(),
+            error
+        ),
+    }
+}
+
+fn print_hook_drift_notification() {
+    eprintln!();
+    eprintln!("{}", "Hook 配置需要更新".yellow());
+    eprintln!(
+        "{}",
+        format!("   运行 '{} hooks install' 更新", BINARY_NAME).yellow()
+    );
+    eprintln!();
 }
 
 /// Handle the update command
@@ -387,12 +415,14 @@ pub fn handle_update(check_only: bool) -> Result<()> {
     println!();
 
     // Perform update
-    download_and_replace(&latest)?;
+    let installed_executable = download_and_replace(&latest)?;
 
     println!();
     println!("{}", "🎉 更新成功！".green().bold());
     println!("   新版本: {}", latest);
     println!();
+
+    check_hook_drift_with(&installed_executable);
 
     Ok(())
 }

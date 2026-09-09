@@ -237,7 +237,7 @@ Codex 和 OMP 历史会话分别从 `~/.codex/sessions/` 与 `~/.omp/agent/sessi
 ```
 启动时: claude-sync → 自动 pull → 启动 Claude Code
 使用中: 检测新项目 → 自动 pull 该项目历史
-每轮对话结束: Stop Hook → 自动 push
+每轮对话结束: Stop Hook → 后台节流推送
 ```
 
 ## 配置同步
