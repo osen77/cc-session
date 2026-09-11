@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,6 +22,7 @@ use crate::{VerbosityLevel, BINARY_NAME};
 const HOOK_EXECUTABLES: &[&str] = &["claude-code-sync", "claude-code-sync.exe", "ccs", "ccs.exe"];
 const PUSH_HOOK_THROTTLE_SECS: u64 = 300;
 const PUSH_HOOK_ALERT_THRESHOLD: u32 = 3;
+const NEW_PROJECT_PULL_COOLDOWN_SECS: u64 = 600;
 const HOOK_FIELDS: &[&str] = &["type", "command", "timeout", "statusMessage"];
 
 fn append_hook_debug(message: &str) {
@@ -56,24 +58,25 @@ fn spawn_ccs_subcommand(
         .status()
 }
 
-fn detached_worker_command(exe: &Path) -> Command {
+fn detached_subcommand_command(exe: &Path, subcommand: &str, args: &[&str]) -> Command {
     let mut command = Command::new(exe);
     command
-        .args(["hook-stop", "--worker"])
+        .arg(subcommand)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     command
 }
 
-/// Spawn the Stop-hook worker without waiting for it.
-fn spawn_detached_worker() -> std::io::Result<Child> {
+/// Spawn a ccs subcommand without waiting for it.
+fn spawn_detached_subcommand(subcommand: &str, args: &[&str]) -> std::io::Result<Child> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(BINARY_NAME));
 
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let mut command = detached_worker_command(&exe);
+        let mut command = detached_subcommand_command(&exe, subcommand, args);
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -94,12 +97,12 @@ fn spawn_detached_worker() -> std::io::Result<Child> {
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const BASE_FLAGS: u32 = DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
 
-        let mut command = detached_worker_command(&exe);
+        let mut command = detached_subcommand_command(&exe, subcommand, args);
         command.creation_flags(BASE_FLAGS | CREATE_BREAKAWAY_FROM_JOB);
         match command.spawn() {
             Ok(child) => Ok(child),
             Err(first_error) => {
-                let mut fallback = detached_worker_command(&exe);
+                let mut fallback = detached_subcommand_command(&exe, subcommand, args);
                 fallback.creation_flags(BASE_FLAGS);
                 fallback.spawn().map_err(|fallback_error| {
                     std::io::Error::new(
@@ -115,8 +118,17 @@ fn spawn_detached_worker() -> std::io::Result<Child> {
 
     #[cfg(not(any(unix, windows)))]
     {
-        detached_worker_command(&exe).spawn()
+        detached_subcommand_command(&exe, subcommand, args).spawn()
     }
+}
+
+/// Spawn the Stop-hook worker without waiting for it.
+fn spawn_detached_worker() -> std::io::Result<Child> {
+    spawn_detached_subcommand("hook-stop", &["--worker"])
+}
+
+fn spawn_detached_pull() -> std::io::Result<Child> {
+    spawn_detached_subcommand("pull", &["--quiet"])
 }
 
 /// Get the path to Claude settings file.
@@ -603,11 +615,105 @@ pub fn handle_hooks_check(quiet: bool) -> Result<()> {
     Err(anyhow::anyhow!("hook configuration drift detected"))
 }
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct NewProjectPullAttempt {
+    #[serde(default)]
+    last_attempt_unix: u64,
+    #[serde(default)]
+    pending_notify: bool,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct NewProjectPullState {
+    #[serde(default)]
+    projects: HashMap<String, NewProjectPullAttempt>,
+}
+
+impl NewProjectPullState {
+    fn load() -> Self {
+        let Ok(path) = ConfigManager::new_project_pull_state_path() else {
+            return Self::default();
+        };
+        let Ok(bytes) = std::fs::read(path) else {
+            return Self::default();
+        };
+        serde_json::from_slice(&bytes).unwrap_or_default()
+    }
+
+    fn save(&self) {
+        let Ok(path) = ConfigManager::new_project_pull_state_path() else {
+            return;
+        };
+        let _ = persist_json_atomic(&path, self);
+    }
+}
+
+fn new_project_notification(project_name: &str) -> String {
+    format!(
+        "Detected remote conversation history for project '{}'. \\
+         It has been pulled. Consider running /clear or restarting \\
+         Claude Code to load the history.",
+        project_name
+    )
+}
+
+fn process_new_project_check(
+    cwd: &str,
+    claude_dir: &Path,
+    now: u64,
+    mut spawn_pull: impl FnMut() -> std::io::Result<()>,
+) -> Option<String> {
+    use crate::sync::discovery::find_local_project_by_name;
+
+    // UserPromptSubmit is only meaningful at the git repository root. In
+    // particular, do not treat a nested source directory or a temporary cwd as
+    // a new project.
+    if !Path::new(cwd).join(".git").exists() {
+        return None;
+    }
+
+    let project_name = cwd
+        .split(&['/', '\\'])
+        .rfind(|s| !s.is_empty())
+        .unwrap_or("unknown");
+    let has_local_project = find_local_project_by_name(claude_dir, project_name).is_some();
+    let mut state = NewProjectPullState::load();
+
+    if has_local_project {
+        let attempt = state.projects.get_mut(project_name)?;
+        if !attempt.pending_notify {
+            return None;
+        }
+        attempt.pending_notify = false;
+        state.save();
+        return Some(new_project_notification(project_name));
+    }
+
+    if state.projects.get(project_name).is_some_and(|attempt| {
+        now.saturating_sub(attempt.last_attempt_unix) < NEW_PROJECT_PULL_COOLDOWN_SECS
+    }) {
+        return None;
+    }
+
+    log::info!("New project detected: {}", project_name);
+    let attempt = state.projects.entry(project_name.to_string()).or_default();
+    attempt.last_attempt_unix = now;
+    attempt.pending_notify = true;
+    state.save();
+
+    // Spawn via current_exe() so it works even when the hook environment PATH
+    // does not include the cargo bin directory. The hook does not wait for pull.
+    if let Err(error) = spawn_pull() {
+        log::debug!("New project pull spawn failed: {}", error);
+    }
+    None
+}
+
 /// Handle the hook-new-project-check command
 /// This is called by the UserPromptSubmit hook to detect new projects
 /// Reads JSON from stdin, outputs JSON to stdout
 pub fn handle_new_project_check() -> Result<()> {
-    use crate::sync::discovery::{claude_projects_dir, find_local_project_by_name};
+    use crate::sync::discovery::claude_projects_dir;
 
     // Read hook input from stdin
     let input: Value = serde_json::from_reader(std::io::stdin())
@@ -621,45 +727,23 @@ pub fn handle_new_project_check() -> Result<()> {
         }
     };
 
-    // Extract project name from cwd (handle both Unix and Windows paths)
-    let project_name = cwd
-        .split(&['/', '\\'])
-        .rfind(|s| !s.is_empty())
-        .unwrap_or("unknown");
+    // Gate before touching Claude's potentially large projects directory.
+    if !Path::new(cwd).join(".git").exists() {
+        return Ok(());
+    }
 
     let claude_dir = match claude_projects_dir() {
         Ok(dir) => dir,
         Err(_) => return Ok(()), // Silently exit if we can't find the projects dir
     };
+    let Some(notification) = process_new_project_check(cwd, &claude_dir, unix_now(), || {
+        spawn_detached_pull().map(|_| ())
+    }) else {
+        return Ok(());
+    };
 
-    // Check if local project directory exists
-    let has_local_project = find_local_project_by_name(&claude_dir, project_name).is_some();
-
-    if !has_local_project {
-        // This is a new project, try to pull from remote
-        log::info!("New project detected: {}", project_name);
-
-        // Spawn via current_exe() so it works even when the hook environment
-        // PATH does not include the cargo bin directory.
-        let pull_result = spawn_ccs_subcommand("pull", &["--quiet"]);
-
-        if pull_result.is_ok() {
-            // Check if we now have a local project after pull
-            if find_local_project_by_name(&claude_dir, project_name).is_some() {
-                // Found remote history, notify user via hook output
-                let output = json!({
-                    "additionalContext": format!(
-                        "Detected remote conversation history for project '{}'. \
-                         It has been pulled. Consider running /clear or restarting \
-                         Claude Code to load the history.",
-                        project_name
-                    )
-                });
-                println!("{}", serde_json::to_string(&output)?);
-            }
-        }
-    }
-
+    let output = json!({ "additionalContext": notification });
+    println!("{}", serde_json::to_string(&output)?);
     Ok(())
 }
 
@@ -1297,6 +1381,157 @@ mod tests {
 
         std::fs::write(ConfigManager::push_hook_state_path().unwrap(), b"not json").unwrap();
         assert_eq!(PushHookState::load(), PushHookState::default());
+    }
+
+    #[test]
+    #[serial]
+    fn new_project_check_ignores_non_git_cwds_without_state_or_pull() {
+        let config_dir = tempdir().unwrap();
+        let _guard = EnvGuard::set(config_dir.path());
+        let claude_dir = tempdir().unwrap();
+        let git_root = tempdir().unwrap();
+        std::fs::create_dir(git_root.path().join(".git")).unwrap();
+        let nested = git_root.path().join("src");
+        std::fs::create_dir(&nested).unwrap();
+        let missing = git_root.path().join("missing");
+        let mut spawn_count = 0;
+
+        for cwd in [nested, missing] {
+            assert_eq!(
+                process_new_project_check(cwd.to_str().unwrap(), claude_dir.path(), 100, || {
+                    spawn_count += 1;
+                    Ok(())
+                }),
+                None
+            );
+        }
+
+        assert_eq!(spawn_count, 0);
+        assert!(!ConfigManager::new_project_pull_state_path()
+            .unwrap()
+            .exists());
+    }
+
+    #[test]
+    #[serial]
+    fn new_project_check_cools_down_and_spawns_after_expiry() {
+        let config_dir = tempdir().unwrap();
+        let _guard = EnvGuard::set(config_dir.path());
+        let claude_dir = tempdir().unwrap();
+        let git_root = tempdir().unwrap();
+        std::fs::create_dir(git_root.path().join(".git")).unwrap();
+        let cwd = git_root.path().to_str().unwrap();
+        let mut spawn_count = 0;
+        let spawn = || {
+            spawn_count += 1;
+            Ok(())
+        };
+
+        assert_eq!(
+            process_new_project_check(cwd, claude_dir.path(), 100, spawn),
+            None
+        );
+        assert_eq!(spawn_count, 1);
+
+        assert_eq!(
+            process_new_project_check(cwd, claude_dir.path(), 200, || {
+                spawn_count += 1;
+                Ok(())
+            }),
+            None
+        );
+        assert_eq!(spawn_count, 1);
+
+        assert_eq!(
+            process_new_project_check(cwd, claude_dir.path(), 701, || {
+                spawn_count += 1;
+                Ok(())
+            }),
+            None
+        );
+        assert_eq!(spawn_count, 2);
+    }
+
+    #[test]
+    #[serial]
+    fn new_project_check_notifies_pending_history_and_clears_flag() {
+        let config_dir = tempdir().unwrap();
+        let _guard = EnvGuard::set(config_dir.path());
+        let claude_dir = tempdir().unwrap();
+        let git_root = tempdir().unwrap();
+        std::fs::create_dir(git_root.path().join(".git")).unwrap();
+        let project_name = git_root.path().file_name().unwrap().to_str().unwrap();
+        std::fs::create_dir(claude_dir.path().join(format!("-tmp-{project_name}"))).unwrap();
+        let mut state = NewProjectPullState::default();
+        state.projects.insert(
+            project_name.to_string(),
+            NewProjectPullAttempt {
+                last_attempt_unix: 100,
+                pending_notify: true,
+            },
+        );
+        state.save();
+
+        let notification = process_new_project_check(
+            git_root.path().to_str().unwrap(),
+            claude_dir.path(),
+            200,
+            || Ok(()),
+        );
+
+        assert_eq!(
+            notification.as_deref(),
+            Some(new_project_notification(project_name).as_str())
+        );
+        assert!(
+            !NewProjectPullState::load()
+                .projects
+                .get(project_name)
+                .unwrap()
+                .pending_notify
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn new_project_check_does_not_notify_while_project_is_still_missing() {
+        let config_dir = tempdir().unwrap();
+        let _guard = EnvGuard::set(config_dir.path());
+        let claude_dir = tempdir().unwrap();
+        let git_root = tempdir().unwrap();
+        std::fs::create_dir(git_root.path().join(".git")).unwrap();
+        let project_name = git_root.path().file_name().unwrap().to_str().unwrap();
+        let mut state = NewProjectPullState::default();
+        state.projects.insert(
+            project_name.to_string(),
+            NewProjectPullAttempt {
+                last_attempt_unix: 100,
+                pending_notify: true,
+            },
+        );
+        state.save();
+        let mut spawn_count = 0;
+
+        assert_eq!(
+            process_new_project_check(
+                git_root.path().to_str().unwrap(),
+                claude_dir.path(),
+                200,
+                || {
+                    spawn_count += 1;
+                    Ok(())
+                },
+            ),
+            None
+        );
+        assert_eq!(spawn_count, 0);
+        assert!(
+            NewProjectPullState::load()
+                .projects
+                .get(project_name)
+                .unwrap()
+                .pending_notify
+        );
     }
 
     #[test]

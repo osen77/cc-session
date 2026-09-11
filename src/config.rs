@@ -144,6 +144,11 @@ impl ConfigManager {
         Ok(Self::config_dir()?.join("push-hook.stamp"))
     }
 
+    /// Get the UserPromptSubmit new-project pull state file.
+    pub fn new_project_pull_state_path() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("new-project-pull-state.json"))
+    }
+
     /// Get the session recycle directory path.
     #[allow(dead_code)]
     pub fn session_recycle_dir() -> Result<PathBuf> {
@@ -260,6 +265,12 @@ mod tests {
 
         let push_hook_stamp = ConfigManager::push_hook_stamp_path().unwrap();
         assert_eq!(push_hook_stamp, config_dir.join("push-hook.stamp"));
+
+        let new_project_pull_state = ConfigManager::new_project_pull_state_path().unwrap();
+        assert_eq!(
+            new_project_pull_state,
+            config_dir.join("new-project-pull-state.json")
+        );
 
         let recycle = ConfigManager::session_recycle_dir().unwrap();
         assert_eq!(recycle, config_dir.join("session-recycle"));
