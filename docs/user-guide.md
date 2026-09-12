@@ -105,6 +105,14 @@ ccs setup
 
 被过滤不等于本地文件不存在。`pull` 如果把远端会话判为 Added，但目标路径已经有本地文件，会保留本地原文件并跳过这条远端会话，同时输出 warning；目标是 symlink 或其他不安全类型时仍会拒绝写入。只有目标路径确实不存在时，Added 会话才会用 no-clobber 方式创建，避免并发进程抢先创建后被覆盖。
 
+冲突合并以 snapshot 保存的原始 bytes 为本轮唯一可信的本地基线，并同时绑定 canonical path 和会话 ID。已有会话文件不会再通过 rename、exchange 或 truncate 替换：Claude Code 可能仍持有原文件描述符，替换 inode 会使它后续写入一个 `--resume` 看不到的旧文件。
+
+自动 Smart Merge 只在结果可以纯追加时落盘：snapshot 里的每个既有 entry 在 merged 结果中必须内容完全不变，合并只允许增加新的完整 JSONL entry。写入前，当前文件还必须保留完整 snapshot bytes 前缀；Claude Code 在 snapshot 后追加的本地行会被视为合法并发扩展。ccs 用 append 模式打开同一个 canonical inode，每个 remote-only entry 都序列化成带换行的完整 JSONL，并以单次 write 追加，最后 `flush` 和 `sync_all`。因此并发本地消息和远端新增消息都会直接留在 canonical 会话中，退出后马上 `claude --resume` 也能看到，不依赖下一次 pull 修复。
+
+如果合并需要修改、删除或替换任一已有 entry，或当前文件出现非追加式变化、malformed 行、identity 不匹配，ccs 会 fail closed：canonical 本地会话保持原样，远端版本以 no-clobber KeepBoth 副本保存，本轮返回 incomplete，并按远端相对路径和 fingerprint 写入 pull guard。`ccs sync` 会停在 push 前。只要 guard 仍存在，同一 session/path 的手动 push、Stop hook 和 prune 都会阻断，即使另一台设备已把远端从 R1 更新到 R2；旧 guard 不能因此放行并覆盖 R2。fingerprint 只用于一次 pull 成功完成当前 revision 后的 CAS 清除。
+
+交互式 Keep Remote 同样不会替换现有会话 inode；无法安全表示为纯追加时会降级为 Keep Both/Pending。Added 和 Keep Both 仍使用同目录 durable staging 与 no-clobber 创建；目标已存在、路径不安全或并发抢占时不会覆盖。
+
 ### 设备 B（加入同步）
 
 ```bash
@@ -248,11 +256,11 @@ ccs wrapper show       # 查看状态
 | `UserPromptSubmit` | 每次发送消息时 | 检测新项目并拉取远程历史 |
 
 > **SessionStart 三重条件检测**：只有同时满足以下条件才会执行 pull：
-> 1. 进程数 = 1（没有其他 Claude 实例）
-> 2. source = "startup"（不是 resume/compact）
-> 3. 5分钟内未触发过（防抖保护）
+> 1. 进程观察结果明确为 1 个 Claude Code 主进程，native 和 npm-global 安装都支持
+> 2. `source = "startup"`，`resume`、`clear`、`compact`、`fork` 都跳过
+> 3. 5 分钟内未触发过
 >
-> 这确保了 `/new`、新窗口、对话压缩等场景不会重复拉取。详见 [Hooks 避坑指南](claude-code-hooks-guide.md)。
+> 进程枚举失败、输出无法解析、匹配数为 0 或多于 1 时，SessionStart 会直接跳过。cooldown 检查、stamp 写入和 pull 由同一把 `last-session-pull.lock` 串行化，两个并发启动不会同时通过检查。wrapper 或后续启动仍可补拉。详见 [Hooks 避坑指南](claude-code-hooks-guide.md)。
 
 ### 调试
 
@@ -821,12 +829,13 @@ ccs push --prune
 
 ### 问题 4：冲突处理
 
-**自动处理：**
-- 冲突文件会保留两个版本
-- 远程版本：`session.jsonl`
-- 本地版本：`session-conflict-<timestamp>.jsonl`
+ccs 会先尝试 Smart Merge。缺少父节点的 orphan 子树会原样保留 `parentUuid`；自环、多节点环或 UUID 数量不守恒时，Smart Merge 失败，不会写出不完整会话。
 
-**手动解决：**
+Smart Merge 失败后，非交互模式会保留本地原文件，并把远端版本写成 `session-conflict-<timestamp>.jsonl`。冲突副本使用 no-clobber 创建，同名文件已经存在时会换一个新名字；扫描同一会话的多个文件时，正式的 `<session_id>.jsonl` 优先于冲突副本，避免副本遮蔽正式会话。交互模式的 Smart Merge 同样只允许 append-only；Keep Remote 不会覆盖现有 inode，而是降级为 Keep Both/Pending。
+
+未完成不是成功：不会清除 suppression，不会写成成功的操作历史，`ccs sync` 也不会继续 push。已有会话始终保留原 inode；安全的 Smart Merge 只向 canonical JSONL 追加完整行，不会产生需要下一次 pull 才能找回的隐藏会话内容。
+
+手动处理：
 1. 查看冲突报告：`ccs report`
 2. 选择需要保留的版本
 3. 删除不需要的文件

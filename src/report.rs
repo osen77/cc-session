@@ -84,7 +84,7 @@ pub struct ConflictDetail {
     /// Possible values include:
     /// - "Keep both (remote renamed to `<path>`)" - Both versions preserved with remote renamed
     /// - "Keep local" - Local version kept, remote discarded
-    /// - "Keep remote" - Remote version kept, local overwritten
+    /// - "Remote copy requested (active local preserved)" - Legacy remote preference awaiting safe KeepBoth application
     /// - "Pending" - No resolution applied yet, user intervention required
     pub resolution: String,
 }
@@ -124,7 +124,9 @@ impl ConflictReport {
                         )
                     }
                     ConflictResolution::KeepLocal => "Keep local".to_string(),
-                    ConflictResolution::KeepRemote => "Keep remote".to_string(),
+                    ConflictResolution::KeepRemote => {
+                        "Remote copy requested (active local preserved)".to_string()
+                    }
                     ConflictResolution::Pending => "Pending".to_string(),
                 },
             })

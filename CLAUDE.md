@@ -25,6 +25,8 @@ claude-code-sync/
 │   ├── sync/                # 同步核心模块
 │   │   ├── discovery.rs     # 🔑 项目发现和匹配逻辑
 │   │   ├── pull.rs          # 拉取远程变更
+│   │   ├── session_write.rs # snapshot 基线、append-only 与 no-clobber 写入
+│   │   ├── pull_guard.rs    # 未完成 pull 的远端 revision 推送保护
 │   │   ├── push.rs          # 推送本地变更
 │   │   ├── init.rs          # 仓库初始化
 │   │   ├── state.rs         # 同步状态管理
@@ -181,7 +183,7 @@ Codex/OMP 的普通 rename/delete 仍为只读；本地维护只移动和恢复�
 **组件**:
 
 1. **Hooks** (`hooks.rs`): Claude Code 原生钩子
-   - `SessionStart`: **首次启动**时自动拉取远程历史（三重条件检测：进程数=1 + source=startup + 5分钟防抖）
+   - `SessionStart`: **首次启动**时自动拉取远程历史。只有进程观察为 `Known(1)`、`source=startup` 且 5 分钟 cooldown 未生效才执行；`Known(0)`、`Unknown`、多实例全部 fail closed
    - `Stop`: 每轮对话完成后后台节流推送（节流 5 分钟、连续失败 3 次后下一轮提示）
    - `UserPromptSubmit`: 检测新项目并拉取远程历史
 
@@ -232,7 +234,7 @@ ccs wrapper install|uninstall|show
 **配置文件位置**:
 - Hooks: `~/.claude/settings.json`
 - Wrapper: 与 `ccs` 同目录下的 `claude-sync`
-- 状态文件（位于 config_dir）: `push-hook.lock`（worker 互斥锁）、`push-hook-state.json`（推送失败计数与状态）、`push-hook.stamp`（节流时间戳）
+- 状态文件（位于 config_dir）: `push-hook.lock`（worker 互斥锁）、`push-hook-state.json`（推送失败计数与状态）、`push-hook.stamp`（节流时间戳）、`last-session-pull.lock` 与 `last-session-pull`（SessionStart 串行锁和 cooldown）
 
 **调试日志**:
 ```bash
@@ -575,9 +577,17 @@ ccs unlock-delete --off           # 提前关闭
 **场景**: 同一对话在不同设备上被修改
 
 **策略**:
-- 保留两个版本
-- 重命名：`session.jsonl` → `session-conflict-<timestamp>.jsonl`
-- 生成冲突报告
+- Smart Merge 使用迭代式父链校验和 DFS，可处理深链；保留正常根与 missing-parent orphan 子树，orphan 的原 `parentUuid` 不改
+- self cycle、多节点 cycle、同侧冲突 UUID、UUID 并集不守恒或重复输出时返回错误，不落盘部分结果；`MergeStats` 记录 expected/emitted/orphan 数量
+- pull 只用 `Snapshot::files` 的原始 bytes 解析本地基线并计算期望 BLAKE3，且把基线绑定到 canonical path 与 `session_id`；malformed 非空行或 identity 不匹配一律 fail closed
+- 已有会话文件禁止原子替换或 truncate：Claude Code 可能仍持有原 inode 的打开 fd，替换 inode 会让后续消息只写入不可见旧文件，`--resume` 会直接看到截断历史
+- 自动 Smart Merge 只接受 append-only 计划：snapshot 中每个 entry 必须在 merged 中逐项内容不变；只允许增加完整的新 JSONL entry。当前文件还必须以 snapshot 原始 bytes 为前缀，新增并发本地行可保留
+- append helper 以 `O_APPEND` 打开 canonical 文件，每个新增 entry 序列化为带换行的完整 JSONL，并用单次 `write` 写入；写后 `flush`/`sync_all`。并发 Claude append 与 remote-only append 都留在同一 inode、同一 canonical 文件，resume 无需再次 pull
+- 如果 Smart Merge 需要编辑、删除或改写任一已有 entry，或当前文件不再是合法 append-only 扩展，自动写入 fail closed：canonical 本地文件保持不动，远端保存为 no-clobber KeepBoth 副本，并持久化 revision-scoped pull guard
+- 显式 KeepRemote 也不得替换活跃会话 inode；guarded 路径统一降级 KeepBoth/Pending。public compatibility `apply_resolutions()` 对 baseline 读取失败、缺失 remote source 或任何未按请求执行的结果返回 `Err`
+- Added 与 Keep Both 使用同目录 staging、`flush`/`sync_all` 和 no-clobber；canonical `<session_id>.jsonl` 在 discovery 去重时优先于 Keep Both 副本
+- 任一会话未完成时 pull 返回结构化 `PullIncomplete`，`sync` 停在 push 前；`pull-guard.json` 存在期间，同 session/path 的 push 和所有 prune 始终阻断，即使远端已从 R1 变成 R2。fingerprint 只用于 pull 成功后的 completed CAS，确保仅清除本次实际处理的当前 revision
+- Smart Merge cycle、UUID 守恒或 append-only 校验失败时不落盘部分结果；冲突报告记录实际 KeepBoth/Pending 结果
 
 ## 常用开发命令
 

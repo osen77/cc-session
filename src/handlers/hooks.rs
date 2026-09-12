@@ -999,157 +999,240 @@ pub fn handle_stop(worker: bool) -> Result<()> {
 /// Extra protection layer to prevent duplicate pulls
 const SESSION_START_DEBOUNCE_SECS: u64 = 300; // 5 minutes
 
-/// Count running Claude Code processes.
-///
-/// The unix branch matches `native-binary/claude`, which only covers the native
-/// install layout. An npm-global install runs from
-/// `@anthropic-ai/claude-code/bin/claude.exe` and matches nothing, so this
-/// returns 0 there and `is_first_instance` in `handle_session_start` is always
-/// true. Widen the pattern before relying on the count for anything.
-#[cfg(unix)]
-fn count_claude_processes() -> usize {
-    let output = std::process::Command::new("sh")
-        .args([
-            "-c",
-            "ps aux | grep 'native-binary/claude' | grep -v grep | wc -l",
-        ])
-        .output();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessObservation {
+    Known(usize),
+    Unknown,
+}
 
-    match output {
-        Ok(out) => String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(1),
-        Err(_) => 1,
+fn process_basename(value: &str) -> &str {
+    value
+        .rsplit(&['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(value)
+}
+
+fn is_excluded_claude_process(args: &str) -> bool {
+    let lower = args.to_ascii_lowercase();
+    [
+        "--bg-pty-host",
+        "--bg-spare",
+        "--mcp-server",
+        "mcp-server",
+        "modelcontextprotocol",
+        "claude-code-daemon",
+        "claude daemon",
+        " daemon run",
+        " hook-session-start",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn is_claude_main_process(command: &str, args: &str) -> bool {
+    if is_excluded_claude_process(args) {
+        return false;
+    }
+    let command = process_basename(command).to_ascii_lowercase();
+    let argv0 = args
+        .split_whitespace()
+        .next()
+        .map(|value| process_basename(value.trim_matches(['\"', '\''])))
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let args_lower = args.to_ascii_lowercase();
+    let native = matches!(command.as_str(), "claude" | "claude.exe")
+        || matches!(argv0.as_str(), "claude" | "claude.exe");
+    let npm = (matches!(command.as_str(), "node" | "node.exe")
+        || matches!(argv0.as_str(), "node" | "node.exe"))
+        && (args_lower.contains("@anthropic-ai/claude-code")
+            || args_lower.contains("@anthropic-ai\\claude-code"))
+        && (args_lower.contains("cli.js")
+            || args_lower.contains("bin/claude")
+            || args_lower.contains("bin\\claude"));
+    native || npm
+}
+
+#[cfg_attr(not(any(test, unix)), allow(dead_code))]
+fn parse_unix_process_listing(success: bool, stdout: &[u8]) -> ProcessObservation {
+    if !success {
+        return ProcessObservation::Unknown;
+    }
+    let Ok(listing) = std::str::from_utf8(stdout) else {
+        return ProcessObservation::Unknown;
+    };
+    let mut count = 0usize;
+    for line in listing.lines().filter(|line| !line.trim().is_empty()) {
+        let mut parts = line.trim_start().splitn(2, char::is_whitespace);
+        let Some(command) = parts.next() else {
+            return ProcessObservation::Unknown;
+        };
+        let Some(args) = parts.next() else {
+            return ProcessObservation::Unknown;
+        };
+        let args = args.trim_start();
+        if is_claude_main_process(command, args) {
+            count += 1;
+        }
+    }
+    ProcessObservation::Known(count)
+}
+
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+fn parse_windows_process_listing(success: bool, stdout: &[u8]) -> ProcessObservation {
+    if !success {
+        return ProcessObservation::Unknown;
+    }
+    let Ok(listing) = std::str::from_utf8(stdout) else {
+        return ProcessObservation::Unknown;
+    };
+    let mut count = 0usize;
+    for line in listing.lines().filter(|line| !line.trim().is_empty()) {
+        let Some((command, args)) = line.split_once('\t') else {
+            return ProcessObservation::Unknown;
+        };
+        if is_claude_main_process(command.trim(), args.trim()) {
+            count += 1;
+        }
+    }
+    ProcessObservation::Known(count)
+}
+
+#[cfg(unix)]
+fn observe_claude_processes() -> ProcessObservation {
+    match Command::new("ps").args(["-axo", "comm=,args="]).output() {
+        Ok(output) => parse_unix_process_listing(output.status.success(), &output.stdout),
+        Err(_) => ProcessObservation::Unknown,
     }
 }
 
 #[cfg(windows)]
-fn count_claude_processes() -> usize {
-    let output = std::process::Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq claude.exe", "/FO", "CSV", "/NH"])
-        .output();
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter(|line| line.to_ascii_lowercase().contains("claude.exe"))
-            .count()
-            .max(1),
-        _ => 1,
+fn observe_claude_processes() -> ProcessObservation {
+    let script = concat!(
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); ",
+        "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.Name)`t$($_.CommandLine)\" }"
+    );
+    match Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .output()
+    {
+        Ok(output) => parse_windows_process_listing(output.status.success(), &output.stdout),
+        Err(_) => ProcessObservation::Unknown,
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn count_claude_processes() -> usize {
-    1
+fn observe_claude_processes() -> ProcessObservation {
+    ProcessObservation::Unknown
 }
 
-/// Handle the hook-session-start command
-/// This is called by the SessionStart hook to pull latest history
-/// Reads JSON from stdin, outputs JSON to stdout
-///
-/// Pulls only on first startup, gated on three conditions:
-/// 1. Process count <= 1 (no other Claude instances) — see
-///    `count_claude_processes`: inert on npm-global installs, where it counts 0
-///    and this condition always passes
-/// 2. source = "startup" (not resume/compact)
-/// 3. Debounce not active (extra protection)
-///
-/// So in practice conditions 2 and 3 are what gate the pull.
-pub fn handle_session_start() -> Result<()> {
-    // Read hook input from stdin (required by Claude Code hooks)
-    let input: Value = serde_json::from_reader(std::io::stdin()).unwrap_or(json!({}));
+fn session_start_debounce_active(stamp_path: &Path, now: SystemTime) -> bool {
+    let metadata = match std::fs::metadata(stamp_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    let Ok(modified) = metadata.modified() else {
+        return true;
+    };
+    now.duration_since(modified).unwrap_or_default().as_secs() < SESSION_START_DEBOUNCE_SECS
+}
 
-    // Extract source field
+fn should_run_session_start_pull(
+    observation: ProcessObservation,
+    source: &str,
+    debounce_active: bool,
+) -> bool {
+    matches!(observation, ProcessObservation::Known(1)) && source == "startup" && !debounce_active
+}
+
+fn run_session_start_gate(
+    observation: ProcessObservation,
+    source: &str,
+    lock_path: &Path,
+    stamp_path: &Path,
+    now: SystemTime,
+    run_pull: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    if !matches!(observation, ProcessObservation::Known(1)) || source != "startup" {
+        return Ok(false);
+    }
+    let Some(_lock) = FileLock::try_acquire(lock_path)? else {
+        return Ok(false);
+    };
+    let debounce_active = session_start_debounce_active(stamp_path, now);
+    if !should_run_session_start_pull(observation, source, debounce_active) {
+        return Ok(false);
+    }
+    run_pull()?;
+    if let Some(parent) = stamp_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let stamp = std::fs::File::create(stamp_path)?;
+    stamp.set_modified(now)?;
+    stamp.sync_all()?;
+    Ok(true)
+}
+
+/// Handle the hook-session-start command. Automatic pull is fail-closed: only
+/// one confidently identified startup process may pull, and the cooldown check,
+/// stamp update, and pull execution share one lock.
+pub fn handle_session_start() -> Result<()> {
+    let input: Value = serde_json::from_reader(std::io::stdin()).unwrap_or(json!({}));
     let source = input
         .get("source")
-        .and_then(|v| v.as_str())
+        .and_then(|value| value.as_str())
         .unwrap_or("unknown");
-
-    // Count Claude Code processes
-    let process_count = count_claude_processes();
-    let is_first_instance = process_count <= 1;
-    let is_startup = source == "startup";
-
-    // Get timestamp file path for debouncing
-    let timestamp_file =
-        crate::config::ConfigManager::config_dir().map(|d| d.join("last-session-pull"));
-
-    // Check debounce
-    let debounce_active = if let Ok(ref ts_path) = timestamp_file {
-        if ts_path.exists() {
-            if let Ok(metadata) = std::fs::metadata(ts_path) {
-                if let Ok(modified) = metadata.modified() {
-                    let elapsed = std::time::SystemTime::now()
-                        .duration_since(modified)
-                        .unwrap_or_default();
-                    elapsed.as_secs() < SESSION_START_DEBOUNCE_SECS
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
+    let observation = observe_claude_processes();
+    let config_dir = match ConfigManager::config_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            append_hook_debug(&format!(
+                "SessionStart pull skipped: config directory unavailable: {error}"
+            ));
+            return Ok(());
         }
-    } else {
-        false
     };
-
+    let stamp_path = config_dir.join("last-session-pull");
+    let lock_path = config_dir.join("last-session-pull.lock");
     append_hook_debug(&format!(
-        "SessionStart (source: {source}, processes: {process_count}, debounce: {debounce_active})"
+        "SessionStart (source: {source}, processes: {observation:?})"
     ));
 
-    // Triple-condition check: first instance + startup + no debounce
-    if !is_first_instance {
-        append_hook_debug(&format!("pull skipped (other instances: {process_count})"));
-        return Ok(());
-    }
-
-    if !is_startup {
-        append_hook_debug(&format!("pull skipped (source: {source} != startup)"));
-        return Ok(());
-    }
-
-    if debounce_active {
-        append_hook_debug("pull skipped (debounce active)");
-        return Ok(());
-    }
-
-    // Update timestamp file before pull
-    if let Ok(ref ts_path) = timestamp_file {
-        let _ = std::fs::write(ts_path, "");
-    }
-
-    // Execute pull quietly (first start confirmed).
-    // Spawn via current_exe() so it works even when the hook environment
-    // PATH does not include the cargo bin directory.
-    let pull_result = spawn_ccs_subcommand("pull", &["--quiet"]);
-
-    match &pull_result {
-        Ok(status) => {
+    let result = run_session_start_gate(
+        observation,
+        source,
+        &lock_path,
+        &stamp_path,
+        SystemTime::now(),
+        || {
+            let status = spawn_ccs_subcommand("pull", &["--quiet"])?;
             append_hook_debug(&format!("SessionStart pull completed: exit code {status}"));
-        }
+            if !status.success() {
+                anyhow::bail!("SessionStart pull exited with {status}");
+            }
+            Ok(())
+        },
+    );
+    let ran = match result {
+        Ok(ran) => ran,
         Err(error) => {
-            append_hook_debug(&format!("SessionStart pull failed: {error}"));
+            append_hook_debug(&format!(
+                "SessionStart pull failed or skipped safely: {error}"
+            ));
+            false
         }
+    };
+    if !ran {
+        append_hook_debug("SessionStart pull skipped by fail-closed gate");
+        return Ok(());
     }
 
-    // If pull succeeded and we got new content, we could notify the user
-    // But for SessionStart, we just silently sync - the user will see the history
-    if let Err(e) = &pull_result {
-        log::debug!("SessionStart pull failed: {}", e);
-    }
-
-    // Auto-apply CLAUDE.md after pull
     if let Ok(filter) = crate::filter::FilterConfig::load() {
         if filter.config_sync.enabled && filter.config_sync.auto_apply_claude_md {
             let _ = super::config_sync::auto_apply_claude_md(&filter.config_sync);
         }
     }
-
-    // Exit successfully - no output needed for SessionStart unless we want to add context
     Ok(())
 }
 
@@ -1548,5 +1631,156 @@ mod tests {
         file.set_modified(now - Duration::from_secs(PUSH_HOOK_THROTTLE_SECS + 1))
             .unwrap();
         assert!(!throttle_active(&stamp, now));
+    }
+    #[test]
+    fn unix_process_listing_recognizes_native_and_npm_main_processes_only() {
+        let listing = r#"claude /Users/me/.local/share/claude/versions/2.1.0/claude
+node node /opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js
+claude /path/claude --bg-pty-host
+claude /path/claude --bg-spare
+node node /opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js --mcp-server
+claude-code-sync /Users/me/.local/bin/claude-code-sync hook-session-start
+python python claude-daemon.py
+"#;
+        assert_eq!(
+            parse_unix_process_listing(true, listing.as_bytes()),
+            ProcessObservation::Known(2)
+        );
+        assert_eq!(
+            parse_unix_process_listing(false, listing.as_bytes()),
+            ProcessObservation::Unknown
+        );
+        assert_eq!(
+            parse_unix_process_listing(true, b""),
+            ProcessObservation::Known(0)
+        );
+        assert_eq!(
+            parse_unix_process_listing(true, b"claude\n"),
+            ProcessObservation::Unknown
+        );
+        let truncated = b"/Users/me/.local/share/claude/versions/2.1.0/clau /Users/me/.local/share/claude/versions/2.1.0/claude\n";
+        assert_eq!(
+            parse_unix_process_listing(true, truncated),
+            ProcessObservation::Known(1)
+        );
+    }
+
+    #[test]
+    fn windows_process_listing_recognizes_native_and_npm_fixtures() {
+        let listing = concat!(
+            "claude.exe\tC:\\Users\\me\\claude.exe\r\n",
+            "node.exe\tnode.exe C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js\r\n",
+            "node.exe\tnode.exe C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js --bg-spare\r\n",
+            "ccs.exe\tccs.exe hook-session-start\r\n",
+            "claude.exe\tC:\\Users\\me\\claude.exe daemon run\r\n"
+        );
+        assert_eq!(
+            parse_windows_process_listing(true, listing.as_bytes()),
+            ProcessObservation::Known(2)
+        );
+        assert_eq!(
+            parse_windows_process_listing(false, listing.as_bytes()),
+            ProcessObservation::Unknown
+        );
+    }
+
+    #[test]
+    fn session_start_gate_fails_closed_except_known_single_startup() {
+        for observation in [
+            ProcessObservation::Known(0),
+            ProcessObservation::Known(2),
+            ProcessObservation::Unknown,
+        ] {
+            assert!(!should_run_session_start_pull(
+                observation,
+                "startup",
+                false
+            ));
+        }
+        for source in ["resume", "clear", "compact", "fork", "unknown"] {
+            assert!(!should_run_session_start_pull(
+                ProcessObservation::Known(1),
+                source,
+                false
+            ));
+        }
+        assert!(!should_run_session_start_pull(
+            ProcessObservation::Known(1),
+            "startup",
+            true
+        ));
+        assert!(should_run_session_start_pull(
+            ProcessObservation::Known(1),
+            "startup",
+            false
+        ));
+    }
+
+    #[test]
+    fn session_start_lock_allows_only_one_concurrent_pull() {
+        use std::sync::{Arc, Barrier};
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("last-session-pull.lock");
+        let stamp_path = dir.path().join("last-session-pull");
+        let barrier = Arc::new(Barrier::new(3));
+        let pulls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            let pulls = Arc::clone(&pulls);
+            let lock_path = lock_path.clone();
+            let stamp_path = stamp_path.clone();
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                run_session_start_gate(
+                    ProcessObservation::Known(1),
+                    "startup",
+                    &lock_path,
+                    &stamp_path,
+                    SystemTime::now(),
+                    || {
+                        pulls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(50));
+                        Ok(())
+                    },
+                )
+                .unwrap()
+            }));
+        }
+        barrier.wait();
+        let outcomes = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(pulls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(outcomes.iter().filter(|ran| **ran).count(), 1);
+    }
+    #[test]
+    fn failed_session_start_pull_does_not_write_cooldown_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("last-session-pull.lock");
+        let stamp_path = dir.path().join("last-session-pull");
+        let failed = run_session_start_gate(
+            ProcessObservation::Known(1),
+            "startup",
+            &lock_path,
+            &stamp_path,
+            SystemTime::now(),
+            || anyhow::bail!("pull failed"),
+        );
+        assert!(failed.is_err());
+        assert!(!stamp_path.exists());
+
+        let retried = run_session_start_gate(
+            ProcessObservation::Known(1),
+            "startup",
+            &lock_path,
+            &stamp_path,
+            SystemTime::now(),
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(retried);
+        assert!(stamp_path.exists());
     }
 }

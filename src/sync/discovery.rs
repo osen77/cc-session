@@ -48,30 +48,28 @@ pub(crate) fn discover_sessions(
         })
         .collect();
 
-    // Deduplicate by session_id, keeping the session with the most messages.
-    // This handles cases where agent subprocess files share the same session_id
-    // as the main conversation file - we want to keep the main file (more messages).
+    // Prefer the canonical `<session_id>.jsonl` over KeepBoth/conflict copies.
+    // Within the same class, keep the entry with more messages so main sessions
+    // still beat smaller agent files.
+    fn is_canonical_session_file(session: &ConversationSession) -> bool {
+        Path::new(&session.file_path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            == Some(session.session_id.as_str())
+    }
+
     let mut session_map: HashMap<String, ConversationSession> = HashMap::new();
     for session in sessions {
         session_map
             .entry(session.session_id.clone())
             .and_modify(|existing| {
-                // Keep the session with more messages
-                if session.message_count() > existing.message_count() {
-                    log::debug!(
-                        "Deduplicating session {}: replacing {} messages with {} messages",
-                        session.session_id,
-                        existing.message_count(),
-                        session.message_count()
-                    );
+                let incoming_canonical = is_canonical_session_file(&session);
+                let existing_canonical = is_canonical_session_file(existing);
+                let replace = (incoming_canonical && !existing_canonical)
+                    || (incoming_canonical == existing_canonical
+                        && session.message_count() > existing.message_count());
+                if replace {
                     *existing = session.clone();
-                } else {
-                    log::debug!(
-                        "Deduplicating session {}: keeping {} messages, discarding {} messages",
-                        existing.session_id,
-                        existing.message_count(),
-                        session.message_count()
-                    );
                 }
             })
             .or_insert(session);
@@ -926,5 +924,39 @@ mod tests {
             sessions.is_empty(),
             "file symlink must not be parsed as a session"
         );
+    }
+    #[test]
+    fn canonical_session_file_wins_over_larger_keep_both_copy() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let make = |uuid: &str| {
+            serde_json::json!({
+                "type": "user",
+                "uuid": uuid,
+                "sessionId": "session",
+                "cwd": "/tmp/project"
+            })
+            .to_string()
+        };
+        fs::write(
+            project.join("session.jsonl"),
+            format!("{}\n", make("canonical")),
+        )
+        .unwrap();
+        fs::write(
+            project.join("session-conflict-20260912.jsonl"),
+            format!("{}\n{}\n", make("copy-1"), make("copy-2")),
+        )
+        .unwrap();
+
+        let sessions =
+            discover_sessions(temp.path(), &crate::filter::FilterConfig::no_size_limit()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            Path::new(&sessions[0].file_path).file_name().unwrap(),
+            "session.jsonl"
+        );
+        assert_eq!(sessions[0].entries[0].uuid.as_deref(), Some("canonical"));
     }
 }

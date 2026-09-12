@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Cursor, Write};
 use std::path::Path;
 
 /// Represents a single line/entry in the JSONL conversation file
@@ -136,6 +136,11 @@ impl ConversationSession {
         let file =
             File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
         Self::from_reader_with_report(BufReader::new(file), path)
+    }
+
+    /// Parse an exact in-memory JSONL snapshot and report malformed non-empty lines.
+    pub(crate) fn from_bytes_with_report(bytes: &[u8], path: &Path) -> Result<ParseOutcome<Self>> {
+        Self::from_reader_with_report(BufReader::new(Cursor::new(bytes)), path)
     }
 
     fn from_reader_with_report<R: BufRead>(reader: R, path: &Path) -> Result<ParseOutcome<Self>> {
@@ -1547,5 +1552,21 @@ mod tests {
         let result = ConversationSession::extract_display_content_full(&msg, true).unwrap();
         // System content filtered, real user message preserved
         assert_eq!(result, "Fix the bug in main.rs");
+    }
+    #[test]
+    fn snapshot_bytes_parser_reports_malformed_lines_from_exact_bytes() {
+        let bytes = br#"{"type":"user","uuid":"a","sessionId":"session"}
+not-json
+"#;
+        let outcome = ConversationSession::from_bytes_with_report(
+            bytes,
+            Path::new("/isolated/session.jsonl"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.value.session_id, "session");
+        assert_eq!(outcome.value.entries.len(), 1);
+        assert_eq!(outcome.malformed_lines, 1);
+        assert_eq!(outcome.value.file_path, "/isolated/session.jsonl");
     }
 }

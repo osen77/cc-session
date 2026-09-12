@@ -198,6 +198,7 @@ mod tests {
             Self { key, original }
         }
 
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         fn remove(key: &'static str) -> Self {
             let original = std::env::var_os(key);
             std::env::remove_var(key);

@@ -24,6 +24,7 @@ use super::discovery::{
     check_directory_structure_consistency, claude_projects_dir, discover_sessions,
     find_colliding_projects,
 };
+use super::pull_guard::PullGuardRegistry;
 use super::state::SyncState;
 use super::MAX_CONVERSATIONS_TO_DISPLAY;
 
@@ -671,6 +672,10 @@ pub fn push_history(
         .iter()
         .map(|s| (s.session_id.clone(), s))
         .collect();
+    // A previous incomplete pull protects the guarded session/path across all
+    // later remote revisions until a pull completes the current revision.
+    // Corrupt guard state fails closed.
+    let pull_guard = PullGuardRegistry::load()?;
 
     // content_hash re-serializes every entry; computed serially inside the copy
     // loop it dominated push time, so precompute both sides in parallel.
@@ -692,6 +697,7 @@ pub fn push_history(
 
     // Track sessions skipped due to missing cwd
     let mut skipped_no_cwd = 0;
+    let mut skipped_pull_guard = 0;
 
     // Mapping from local project dir -> sync repo project dir (for memory sync)
     let mut project_dir_to_sync: HashMap<PathBuf, PathBuf> = HashMap::new();
@@ -739,8 +745,24 @@ pub fn push_history(
 
         let dest_path = safe_join_within_root(&projects_dir, &relative_path)?;
 
-        // Determine operation type based on existing state
         let existing = existing_map.get(&session.session_id);
+        if let Some(existing_remote) = existing {
+            if pull_guard.suppresses_push(
+                &session.session_id,
+                &relative_path,
+                Path::new(&existing_remote.file_path),
+            )? {
+                skipped_pull_guard += 1;
+                log::warn!(
+                    "Skipping push for unresolved pull session {} at {}",
+                    session.session_id,
+                    relative_path.display()
+                );
+                continue;
+            }
+        }
+
+        // Determine operation type based on existing state
         let operation = if existing.is_some() {
             if existing_hashes.get(&session.session_id) == local_hashes.get(&session.session_id) {
                 unchanged_count += 1;
@@ -788,6 +810,11 @@ pub fn push_history(
         println!("  {} Unchanged: {}", "•".dimmed(), unchanged_count);
         let total_with_cwd = sessions.len().saturating_sub(skipped_no_cwd);
         println!("  {} Skipped (no cwd): {}", "•".dimmed(), skipped_no_cwd);
+        println!(
+            "  {} Skipped (incomplete pull guard): {}",
+            "•".yellow(),
+            skipped_pull_guard
+        );
         println!(
             "  {} Sessions (with project context): {}",
             "•".cyan(),
@@ -960,8 +987,14 @@ pub fn push_history(
     } else {
         match action {
             MissingAction::PruneManual | MissingAction::PruneUnlock(_) => {
-                let actionable_missing =
+                let mut actionable_missing =
                     missing_for_action(&missing_in_repo, maintenance_state.as_ref(), &action);
+                actionable_missing.retain(|relative| {
+                    let remote_file = projects_dir.join(relative);
+                    !pull_guard
+                        .protects_remote_path(relative, &remote_file)
+                        .unwrap_or(true)
+                });
                 // Physical sync of the deletion. No tombstone is written —
                 // prune/window are physical syncs, not intentional-delete
                 // registrations.

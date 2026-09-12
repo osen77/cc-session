@@ -1,11 +1,9 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
 use inquire::Confirm;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use tempfile::NamedTempFile;
 
 use crate::config::ConfigManager;
 use crate::conflict::ConflictDetector;
@@ -26,9 +24,59 @@ use crate::session_cache::fingerprint_file;
 use crate::session_maintenance::state::{LifecycleState, StateStore};
 use crate::session_maintenance::{suppression_for_remote, SuppressionDecision};
 use crate::session_model::{SessionIdentity, SessionSource};
+use crate::sync::pull_guard::{PullGuardEntry, PullGuardRegistry};
+#[cfg(test)]
+use crate::sync::session_write::write_new_session_noclobber_with_hook;
+use crate::sync::session_write::{
+    append_merged_entries_guarded, write_new_session_noclobber, AppendSessionWriteOutcome,
+    NewSessionWriteOutcome, SessionBaseline,
+};
 use crate::sync::tombstone::TombstoneRegistry;
 use crate::undo::Snapshot;
 use crate::BINARY_NAME;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PullIncompleteSession {
+    pub(crate) session_id: String,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PullIncomplete {
+    pub(crate) sessions: Vec<PullIncompleteSession>,
+}
+
+impl std::fmt::Display for PullIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pull incomplete: {} session(s) were deferred safely",
+            self.sessions.len()
+        )
+    }
+}
+
+impl std::error::Error for PullIncomplete {}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_SNAPSHOT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_after_snapshot_hook(hook: impl FnOnce() + 'static) {
+    AFTER_SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_after_snapshot_hook() {
+    AFTER_SNAPSHOT_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingSuppressionClear {
@@ -51,6 +99,7 @@ enum SuppressionApplyOutcome {
     SkippedNoLocalProject,
     Cancelled,
     WriteFailed,
+    SkippedChanged,
     SkippedExistingTarget,
 }
 
@@ -131,17 +180,39 @@ fn prepare_local_session_destination(local_root: &Path, relative: &Path) -> Resu
     prepare_regular_file_destination(local_root, relative)
 }
 
-fn write_session_within_local_root(
-    session: &ConversationSession,
+fn parse_snapshot_session(
+    conflict: &crate::conflict::Conflict,
+    baseline: &SessionBaseline,
+) -> Result<ConversationSession> {
+    baseline.parse_session(&conflict.local_file, &conflict.session_id)
+}
+
+fn revalidate_unchanged_session(
+    discovery_local: &ConversationSession,
+    remote: &ConversationSession,
     local_root: &Path,
     relative: &Path,
-) -> Result<PathBuf> {
-    prepare_local_session_destination(local_root, relative)?;
-    // Rebuild and revalidate immediately before the write. A same-UID
-    // replacement after this check remains the documented narrow TOCTOU residual.
+) -> Result<bool> {
     let destination = prepare_local_session_destination(local_root, relative)?;
-    session.write_to_file(&destination)?;
-    Ok(destination)
+    let outcome = match ConversationSession::from_file_with_report(&destination) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            log::warn!(
+                "Unchanged session revalidation failed for {}: {}",
+                destination.display(),
+                error
+            );
+            return Ok(false);
+        }
+    };
+    if outcome.malformed_lines > 0
+        || outcome.value.session_id != remote.session_id
+        || discovery_local.session_id != remote.session_id
+    {
+        return Ok(false);
+    }
+    let current_hash = outcome.value.content_hash();
+    Ok(current_hash == discovery_local.content_hash() && current_hash == remote.content_hash())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,14 +221,26 @@ enum AddedSessionWriteOutcome {
     SkippedExisting(PathBuf),
 }
 
+fn map_added_outcome(outcome: NewSessionWriteOutcome) -> AddedSessionWriteOutcome {
+    match outcome {
+        NewSessionWriteOutcome::Written { path, .. } => AddedSessionWriteOutcome::Written(path),
+        NewSessionWriteOutcome::SkippedExisting(path) => {
+            AddedSessionWriteOutcome::SkippedExisting(path)
+        }
+    }
+}
+
 fn write_added_session_without_overwrite(
     session: &ConversationSession,
     local_root: &Path,
     relative: &Path,
 ) -> Result<AddedSessionWriteOutcome> {
-    write_added_session_without_overwrite_with_hook(session, local_root, relative, |_| Ok(()))
+    Ok(map_added_outcome(write_new_session_noclobber(
+        session, local_root, relative,
+    )?))
 }
 
+#[cfg(test)]
 fn write_added_session_without_overwrite_with_hook<F>(
     session: &ConversationSession,
     local_root: &Path,
@@ -167,55 +250,12 @@ fn write_added_session_without_overwrite_with_hook<F>(
 where
     F: FnOnce(&Path) -> Result<()>,
 {
-    let destination = prepare_local_session_destination(local_root, relative)?;
-    match fs::symlink_metadata(&destination) {
-        Ok(_) => {
-            let destination = prepare_local_session_destination(local_root, relative)?;
-            return Ok(AddedSessionWriteOutcome::SkippedExisting(destination));
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-
-    let parent = destination
-        .parent()
-        .context("local session destination has no parent")?;
-    let mut temp = NamedTempFile::new_in(parent).with_context(|| {
-        format!(
-            "Failed to create temporary session file in {}",
-            parent.display()
-        )
-    })?;
-    for entry in &session.entries {
-        let json =
-            serde_json::to_string(entry).context("Failed to serialize conversation entry")?;
-        writeln!(temp, "{json}").with_context(|| {
-            format!(
-                "Failed to write temporary session file for {}",
-                destination.display()
-            )
-        })?;
-    }
-    temp.flush()?;
-    temp.as_file().sync_all()?;
-
-    // Revalidate immediately before the atomic no-clobber commit. If another
-    // process creates the target first, preserve that file rather than replacing it.
-    prepare_local_session_destination(local_root, relative)?;
-    before_commit(&destination)?;
-    match temp.persist_noclobber(&destination) {
-        Ok(_) => Ok(AddedSessionWriteOutcome::Written(destination)),
-        Err(error) if error.error.kind() == ErrorKind::AlreadyExists => {
-            let destination = prepare_local_session_destination(local_root, relative)?;
-            Ok(AddedSessionWriteOutcome::SkippedExisting(destination))
-        }
-        Err(error) => Err(error.error).with_context(|| {
-            format!(
-                "Failed to create local session without overwriting: {}",
-                destination.display()
-            )
-        }),
-    }
+    Ok(map_added_outcome(write_new_session_noclobber_with_hook(
+        session,
+        local_root,
+        relative,
+        before_commit,
+    )?))
 }
 
 fn propagate_tombstones(local_projects_root: &Path, registry: &TombstoneRegistry) -> Result<usize> {
@@ -486,7 +526,7 @@ pub fn pull_history(
         }
     }
 
-    // Discover local sessions
+    // Discover local sessions.
     println!("  {} local sessions...", "Discovering".cyan());
     let local_sessions = discover_sessions(&claude_dir, &filter)?;
     println!(
@@ -582,6 +622,18 @@ pub fn pull_history(
         "Found".green(),
         remote_sessions.len()
     );
+    let remote_revisions: HashMap<String, (PathBuf, String)> = remote_sessions
+        .iter()
+        .map(|session| {
+            let path = Path::new(&session.file_path);
+            let relative = path
+                .strip_prefix(&remote_projects_dir)
+                .context("remote session is outside sync projects root")?
+                .to_path_buf();
+            let fingerprint = fingerprint_file(path)?.digest;
+            Ok((session.session_id.clone(), (relative, fingerprint)))
+        })
+        .collect::<Result<_>>()?;
     if suppressed_remote_count > 0 && verbosity != VerbosityLevel::Quiet {
         println!(
             "  {} Suppressed {} unchanged locally recycled session(s)",
@@ -601,59 +653,6 @@ pub fn pull_history(
     detector.detect(&local_sessions, &remote_sessions);
 
     // ============================================================================
-    // SNAPSHOT CREATION: Only backup files that have conflicts
-    // ============================================================================
-    // Optimization: Only backup local files that have conflicts and will be merged.
-    // Files that are new (remote-only) or unchanged don't need backup.
-    // This reduces snapshot size from potentially gigabytes to typically <1MB.
-    let snapshot_path = if detector.has_conflicts() {
-        println!(
-            "  {} snapshot of {} conflicting files...",
-            "Creating".cyan(),
-            detector.conflict_count()
-        );
-
-        // Only collect paths for files that have conflicts
-        let conflicting_file_paths: Vec<PathBuf> = detector
-            .conflicts()
-            .iter()
-            .map(|c| c.local_file.clone())
-            .collect();
-
-        // Check for large conversation files and warn users
-        warn_large_files(&conflicting_file_paths);
-
-        // Create snapshot of ONLY conflicting files
-        let snapshot = Snapshot::create(
-            OperationType::Pull,
-            conflicting_file_paths.iter(),
-            None, // No git manager needed for pull snapshots
-        )
-        .context("Failed to create snapshot before pull")?;
-
-        // Save snapshot to disk
-        let path = snapshot
-            .save_to_disk(None)
-            .context("Failed to save snapshot to disk")?;
-
-        if verbosity != VerbosityLevel::Quiet {
-            println!(
-                "  {} Snapshot created: {} ({} files)",
-                "✓".green(),
-                path.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| path.display().to_string()),
-                conflicting_file_paths.len()
-            );
-        }
-
-        Some(path)
-    } else {
-        println!("  {} No conflicts - skipping snapshot", "✓".green());
-        None
-    };
-
-    // ============================================================================
     // SHOW SUMMARY AND INTERACTIVE CONFIRMATION
     // ============================================================================
     if verbosity != VerbosityLevel::Quiet {
@@ -668,14 +667,12 @@ pub fn pull_history(
         println!();
     }
 
-    // Show detailed file list in verbose mode
     if verbosity == VerbosityLevel::Verbose {
         println!("{}", "Remote sessions to be pulled:".bold());
         for (idx, session) in remote_sessions.iter().enumerate().take(20) {
             let relative_path = Path::new(&session.file_path)
                 .strip_prefix(&remote_projects_dir)
                 .unwrap_or(Path::new(&session.file_path));
-
             println!(
                 "  {}. {} ({} messages)",
                 idx + 1,
@@ -689,7 +686,8 @@ pub fn pull_history(
         println!();
     }
 
-    // Interactive confirmation
+    // Confirm before capturing baselines so interactive waiting cannot make the
+    // snapshot stale before conflict resolution even begins.
     if interactive && interactive_conflict::is_interactive() {
         let confirm =
             Confirm::new("Do you want to proceed with pulling and merging these changes?")
@@ -699,7 +697,6 @@ pub fn pull_history(
                 )
                 .prompt()
                 .context("Failed to get confirmation")?;
-
         if !confirm {
             println!("\n{}", "Pull cancelled.".yellow());
             for token in pending_suppression_clears.values() {
@@ -715,10 +712,77 @@ pub fn pull_history(
     }
 
     // ============================================================================
+    // SNAPSHOT CREATION AND EXACT CONFLICT BASELINES
+    // ============================================================================
+    let mut conflict_baselines: HashMap<String, SessionBaseline> = HashMap::new();
+    let snapshot_path = if detector.has_conflicts() {
+        println!(
+            "  {} snapshot of {} conflicting files...",
+            "Creating".cyan(),
+            detector.conflict_count()
+        );
+        let conflicting_file_paths: Vec<PathBuf> = detector
+            .conflicts()
+            .iter()
+            .map(|conflict| conflict.local_file.clone())
+            .collect();
+        warn_large_files(&conflicting_file_paths);
+        let snapshot = Snapshot::create(OperationType::Pull, conflicting_file_paths.iter(), None)
+            .context("Failed to create snapshot before pull")?;
+        for conflict in detector.conflicts() {
+            let key = conflict.local_file.to_string_lossy();
+            if let Some(bytes) = snapshot.files.get(key.as_ref()) {
+                match SessionBaseline::from_snapshot(
+                    &conflict.local_file,
+                    &conflict.session_id,
+                    bytes.clone(),
+                ) {
+                    Ok(baseline) => {
+                        conflict_baselines.insert(conflict.session_id.clone(), baseline);
+                    }
+                    Err(error) => log::warn!(
+                        "Snapshot baseline path binding failed for {}: {}",
+                        conflict.local_file.display(),
+                        error
+                    ),
+                }
+            } else {
+                log::warn!(
+                    "Snapshot did not capture conflict baseline {}; this session will be skipped",
+                    conflict.local_file.display()
+                );
+            }
+        }
+        let path = snapshot
+            .save_to_disk(None)
+            .context("Failed to save snapshot to disk")?;
+        if verbosity != VerbosityLevel::Quiet {
+            println!(
+                "  {} Snapshot created: {} ({} files)",
+                "✓".green(),
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string()),
+                conflicting_file_paths.len()
+            );
+        }
+        Some(path)
+    } else {
+        println!("  {} No conflicts - skipping snapshot", "✓".green());
+        None
+    };
+
+    #[cfg(test)]
+    run_after_snapshot_hook();
+
+    // ============================================================================
     // CONFLICT RESOLUTION (detection already done above)
     // ============================================================================
     // Track affected conversations for operation record
     let mut affected_conversations: Vec<ConversationSummary> = Vec::new();
+    let mut skipped_changed_count = 0usize;
+    let mut incomplete_reasons: HashMap<String, String> = HashMap::new();
+    let mut completed_sessions: HashSet<String> = HashSet::new();
 
     if detector.has_conflicts() {
         println!(
@@ -732,106 +796,206 @@ pub fn pull_history(
         // ============================================================================
         println!("  {} smart merge...", "Attempting".cyan());
 
-        let local_map: HashMap<_, _> = local_sessions
-            .iter()
-            .map(|s| (s.session_id.clone(), s))
-            .collect();
-
         let remote_map: HashMap<_, _> = remote_sessions
             .iter()
-            .map(|s| (s.session_id.clone(), s))
+            .map(|session| (session.session_id.clone(), session))
             .collect();
 
         let mut smart_merge_success_count = 0;
         let mut smart_merge_failed_conflicts = Vec::new();
+        let mut baseline_sessions = HashMap::new();
 
         for conflict in detector.conflicts_mut() {
-            // Find local and remote sessions
-            if let (Some(local_session), Some(remote_session)) = (
-                local_map.get(&conflict.session_id),
-                remote_map.get(&conflict.session_id),
-            ) {
-                // Try smart merge
-                match conflict.try_smart_merge(local_session, remote_session) {
-                    Ok(()) => {
-                        smart_merge_success_count += 1;
-                        // Write merged result to local file
-                        if let crate::conflict::ConflictResolution::SmartMerge {
-                            ref merged_entries,
-                            ref stats,
-                        } = conflict.resolution
-                        {
-                            // Create a new session with merged entries
-                            let merged_session = ConversationSession {
-                                session_id: conflict.session_id.clone(),
-                                entries: merged_entries.clone(),
-                                file_path: conflict.local_file.to_string_lossy().to_string(),
-                            };
+            let identity = SessionIdentity {
+                source: SessionSource::Claude,
+                session_id: conflict.session_id.clone(),
+            };
+            let Some(baseline) = conflict_baselines.get(&conflict.session_id) else {
+                skipped_changed_count += 1;
+                incomplete_reasons.insert(
+                    conflict.session_id.clone(),
+                    "snapshot baseline unavailable".to_string(),
+                );
+                println!(
+                    "  {} Skipped {} because its exact local snapshot baseline is unavailable",
+                    "!".yellow(),
+                    conflict.session_id
+                );
+                clear_pending_suppression_after_outcome(
+                    maintenance_store.as_ref(),
+                    &pending_suppression_clears,
+                    &identity,
+                    SuppressionApplyOutcome::SkippedChanged,
+                );
+                continue;
+            };
+            let baseline_session = match parse_snapshot_session(conflict, baseline) {
+                Ok(session) => session,
+                Err(error) => {
+                    skipped_changed_count += 1;
+                    incomplete_reasons.insert(
+                        conflict.session_id.clone(),
+                        "malformed or mismatched snapshot baseline".to_string(),
+                    );
+                    log::warn!(
+                        "Skipping conflict {} because its exact snapshot baseline is malformed: {}",
+                        conflict.session_id,
+                        error
+                    );
+                    println!(
+                        "  {} Skipped {} because its local snapshot contains malformed JSONL",
+                        "!".yellow(),
+                        conflict.session_id
+                    );
+                    clear_pending_suppression_after_outcome(
+                        maintenance_store.as_ref(),
+                        &pending_suppression_clears,
+                        &identity,
+                        SuppressionApplyOutcome::SkippedChanged,
+                    );
+                    continue;
+                }
+            };
+            baseline_sessions.insert(conflict.session_id.clone(), baseline_session.clone());
+            let Some(remote_session) = remote_map.get(&conflict.session_id) else {
+                continue;
+            };
 
-                            // Rebuild the destination from the trusted local root.
-                            let local_relative = conflict
-                                .local_file
-                                .strip_prefix(&claude_dir)
-                                .context("conflict destination is outside Claude projects root")?;
-                            if let Err(e) = write_session_within_local_root(
-                                &merged_session,
-                                &claude_dir,
-                                local_relative,
+            match conflict.try_smart_merge(&baseline_session, remote_session) {
+                Ok(()) => {
+                    let crate::conflict::ConflictResolution::SmartMerge {
+                        ref merged_entries,
+                        ref stats,
+                    } = conflict.resolution
+                    else {
+                        unreachable!("successful smart merge must set SmartMerge resolution")
+                    };
+                    let merged_session = ConversationSession {
+                        session_id: conflict.session_id.clone(),
+                        entries: merged_entries.clone(),
+                        file_path: conflict.local_file.to_string_lossy().to_string(),
+                    };
+                    let local_relative = conflict
+                        .local_file
+                        .strip_prefix(&claude_dir)
+                        .context("conflict destination is outside Claude projects root")?;
+                    match append_merged_entries_guarded(
+                        &claude_dir,
+                        local_relative,
+                        baseline,
+                        &merged_session.entries,
+                    ) {
+                        Ok(AppendSessionWriteOutcome::Written {
+                            entries_added,
+                            durability,
+                        }) => {
+                            smart_merge_success_count += 1;
+                            completed_sessions.insert(conflict.session_id.clone());
+                            incomplete_reasons.remove(&conflict.session_id);
+                            println!(
+                                "  {} Smart merged {} by appending {} complete JSONL entr{} ({}/{} UUIDs, durability: {:?})",
+                                "✓".green(),
+                                conflict.session_id,
+                                entries_added,
+                                if entries_added == 1 { "y" } else { "ies" },
+                                stats.emitted_uuid_count,
+                                stats.expected_uuid_count,
+                                durability
+                            );
+                            clear_pending_suppression_after_outcome(
+                                maintenance_store.as_ref(),
+                                &pending_suppression_clears,
+                                &identity,
+                                SuppressionApplyOutcome::Written,
+                            );
+                            match ConversationSummary::new(
+                                conflict.session_id.clone(),
+                                local_relative.to_string_lossy().to_string(),
+                                merged_session.latest_timestamp(),
+                                merged_session.message_count(),
+                                SyncOperation::Conflict,
                             ) {
-                                log::warn!(
-                                    "Failed to write merged session {}: {}",
+                                Ok(summary) => affected_conversations.push(summary),
+                                Err(error) => log::warn!(
+                                    "Failed to record append-only SmartMerge {}: {}",
                                     conflict.session_id,
-                                    e
-                                );
-                                let identity = SessionIdentity {
-                                    source: SessionSource::Claude,
-                                    session_id: conflict.session_id.clone(),
-                                };
-                                clear_pending_suppression_after_outcome(
-                                    maintenance_store.as_ref(),
-                                    &pending_suppression_clears,
-                                    &identity,
-                                    SuppressionApplyOutcome::WriteFailed,
-                                );
-                                smart_merge_failed_conflicts.push(conflict.clone());
-                            } else {
-                                println!(
-                                    "  {} Smart merged {} ({} local + {} remote = {} total, {} branches)",
-                                    "✓".green(),
-                                    conflict.session_id,
-                                    stats.local_messages,
-                                    stats.remote_messages,
-                                    stats.merged_messages,
-                                    stats.branches_detected
-                                );
-                                let identity = SessionIdentity {
-                                    source: SessionSource::Claude,
-                                    session_id: conflict.session_id.clone(),
-                                };
-                                clear_pending_suppression_after_outcome(
-                                    maintenance_store.as_ref(),
-                                    &pending_suppression_clears,
-                                    &identity,
-                                    SuppressionApplyOutcome::Written,
-                                );
+                                    error
+                                ),
                             }
                         }
+                        Ok(AppendSessionWriteOutcome::Noop) => {
+                            smart_merge_success_count += 1;
+                            completed_sessions.insert(conflict.session_id.clone());
+                            incomplete_reasons.remove(&conflict.session_id);
+                            println!(
+                                "  {} Smart merge for {} required no local write ({}/{} UUIDs)",
+                                "✓".green(),
+                                conflict.session_id,
+                                stats.emitted_uuid_count,
+                                stats.expected_uuid_count
+                            );
+                            clear_pending_suppression_after_outcome(
+                                maintenance_store.as_ref(),
+                                &pending_suppression_clears,
+                                &identity,
+                                SuppressionApplyOutcome::Unchanged,
+                            );
+                            match ConversationSummary::new(
+                                conflict.session_id.clone(),
+                                local_relative.to_string_lossy().to_string(),
+                                merged_session.latest_timestamp(),
+                                merged_session.message_count(),
+                                SyncOperation::Conflict,
+                            ) {
+                                Ok(summary) => affected_conversations.push(summary),
+                                Err(error) => log::warn!(
+                                    "Failed to record no-op SmartMerge {}: {}",
+                                    conflict.session_id,
+                                    error
+                                ),
+                            }
+                        }
+                        Ok(AppendSessionWriteOutcome::SkippedChanged) => {
+                            conflict.resolution = crate::conflict::ConflictResolution::Pending;
+                            log::warn!(
+                                "Append-only SmartMerge preconditions changed for {}; falling back to KeepBoth",
+                                conflict.session_id
+                            );
+                            clear_pending_suppression_after_outcome(
+                                maintenance_store.as_ref(),
+                                &pending_suppression_clears,
+                                &identity,
+                                SuppressionApplyOutcome::SkippedChanged,
+                            );
+                            smart_merge_failed_conflicts.push(conflict.clone());
+                        }
+                        Err(error) => {
+                            conflict.resolution = crate::conflict::ConflictResolution::Pending;
+                            log::warn!(
+                                "SmartMerge for {} requires rewriting existing entries or append failed; falling back to KeepBoth: {}",
+                                conflict.session_id,
+                                error
+                            );
+                            clear_pending_suppression_after_outcome(
+                                maintenance_store.as_ref(),
+                                &pending_suppression_clears,
+                                &identity,
+                                SuppressionApplyOutcome::WriteFailed,
+                            );
+                            smart_merge_failed_conflicts.push(conflict.clone());
+                        }
                     }
-                    Err(e) => {
-                        log::warn!("Smart merge failed for {}: {}", conflict.session_id, e);
-                        log::info!("Falling back to manual resolution...");
-                        let identity = SessionIdentity {
-                            source: SessionSource::Claude,
-                            session_id: conflict.session_id.clone(),
-                        };
-                        clear_pending_suppression_after_outcome(
-                            maintenance_store.as_ref(),
-                            &pending_suppression_clears,
-                            &identity,
-                            SuppressionApplyOutcome::WriteFailed,
-                        );
-                        smart_merge_failed_conflicts.push(conflict.clone());
-                    }
+                }
+                Err(error) => {
+                    log::warn!("Smart merge failed for {}: {}", conflict.session_id, error);
+                    log::info!("Falling back to manual resolution...");
+                    clear_pending_suppression_after_outcome(
+                        maintenance_store.as_ref(),
+                        &pending_suppression_clears,
+                        &identity,
+                        SuppressionApplyOutcome::WriteFailed,
+                    );
+                    smart_merge_failed_conflicts.push(conflict.clone());
                 }
             }
         }
@@ -851,115 +1015,108 @@ pub fn pull_history(
                 smart_merge_failed_conflicts.len()
             );
 
-            // Check if we can run interactively
             let use_interactive = crate::interactive_conflict::is_interactive();
-
-            if use_interactive {
-                // Interactive conflict resolution for failed merges
+            let resolution_result = if use_interactive {
                 println!(
                     "\n{} Running in interactive mode for remaining conflicts",
                     "→".cyan()
                 );
-
-                let resolution_result = crate::interactive_conflict::resolve_conflicts_interactive(
-                    &mut smart_merge_failed_conflicts,
-                )?;
-
-                // Apply the resolutions
-                let renames = crate::interactive_conflict::apply_resolutions(
-                    &resolution_result,
-                    &remote_sessions,
-                    &claude_dir,
-                    &remote_projects_dir,
-                )?;
-
-                for conflict in resolution_result
-                    .smart_merge
+                let baseline_map: HashMap<_, _> = baseline_sessions
                     .iter()
-                    .chain(resolution_result.keep_remote.iter())
-                    .chain(resolution_result.keep_both.iter())
-                {
-                    let identity = SessionIdentity {
-                        source: SessionSource::Claude,
-                        session_id: conflict.session_id.clone(),
-                    };
-                    clear_pending_suppression_after_outcome(
-                        maintenance_store.as_ref(),
-                        &pending_suppression_clears,
-                        &identity,
-                        SuppressionApplyOutcome::Written,
-                    );
-                }
-
-                // Save conflict report
-                let report = ConflictReport::from_conflicts(detector.conflicts());
-                save_conflict_report(&report)?;
-
-                renames
+                    .map(|(session_id, session)| (session_id.clone(), session))
+                    .collect();
+                crate::interactive_conflict::resolve_conflicts_interactive_with_sessions(
+                    &mut smart_merge_failed_conflicts,
+                    Some(&baseline_map),
+                    Some(&remote_map),
+                )?
             } else {
-                // Non-interactive mode: use "keep both" strategy for failed merges
                 println!(
                     "\n{} Using automatic conflict resolution (keep both versions)",
                     "→".cyan()
                 );
+                let mut result = crate::interactive_conflict::ResolutionResult::new();
+                result.keep_both = smart_merge_failed_conflicts.clone();
+                result
+            };
 
-                let mut renames = Vec::new();
-                let mut successful_keep_both_ids = Vec::new();
-
-                println!("\n{}", "Conflict Resolution:".yellow().bold());
-                for conflict in &smart_merge_failed_conflicts {
-                    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-                    let conflict_suffix = format!("conflict-{timestamp}");
-
-                    if let Ok(renamed_path) = conflict.clone().resolve_keep_both(&conflict_suffix) {
-                        let relative_renamed = renamed_path
-                            .strip_prefix(&claude_dir)
-                            .unwrap_or(&renamed_path);
-                        println!(
-                            "  {} remote version saved as: {}",
-                            "→".yellow(),
-                            relative_renamed.display().to_string().cyan()
-                        );
-
-                        // Find and write the remote session through the trusted local root.
-                        if let Some(session) = remote_sessions
-                            .iter()
-                            .find(|s| s.session_id == conflict.session_id)
-                        {
-                            let renamed_relative = renamed_path.strip_prefix(&claude_dir).context(
-                                "conflict copy destination is outside Claude projects root",
-                            )?;
-                            write_session_within_local_root(
-                                session,
-                                &claude_dir,
-                                renamed_relative,
-                            )?;
-                            successful_keep_both_ids.push(conflict.session_id.clone());
-                        }
-
-                        renames.push((conflict.remote_file.clone(), renamed_path));
-                    }
-                }
-
-                for session_id in successful_keep_both_ids {
-                    let identity = SessionIdentity {
-                        source: SessionSource::Claude,
-                        session_id,
-                    };
-                    clear_pending_suppression_after_outcome(
-                        maintenance_store.as_ref(),
-                        &pending_suppression_clears,
-                        &identity,
-                        SuppressionApplyOutcome::Written,
+            let applied = match crate::interactive_conflict::apply_resolutions_guarded(
+                &resolution_result,
+                &remote_sessions,
+                &claude_dir,
+                &remote_projects_dir,
+                &conflict_baselines,
+            ) {
+                Ok(applied) => applied,
+                Err(error) => {
+                    log::warn!(
+                        "Conflict fallback could not write a local remote copy; remote remains protected in the sync repository: {}",
+                        error
                     );
+                    for conflict in &smart_merge_failed_conflicts {
+                        incomplete_reasons.insert(
+                            conflict.session_id.clone(),
+                            format!("conflict fallback write failed: {error}"),
+                        );
+                    }
+                    crate::interactive_conflict::GuardedApplyResult::default()
                 }
-
-                // Save conflict report
-                let report = ConflictReport::from_conflicts(detector.conflicts());
-                save_conflict_report(&report)?;
-
-                renames
+            };
+            for (session_id, outcome) in &applied.outcomes {
+                let identity = SessionIdentity {
+                    source: SessionSource::Claude,
+                    session_id: session_id.clone(),
+                };
+                let suppression_outcome = match outcome {
+                    crate::interactive_conflict::GuardedApplyOutcome::Written { .. } => {
+                        completed_sessions.insert(session_id.clone());
+                        incomplete_reasons.remove(session_id);
+                        SuppressionApplyOutcome::Written
+                    }
+                    crate::interactive_conflict::GuardedApplyOutcome::CreatedConflictCopy {
+                        ..
+                    } => {
+                        incomplete_reasons.insert(
+                            session_id.clone(),
+                            "remote preserved as KeepBoth after incomplete merge".to_string(),
+                        );
+                        SuppressionApplyOutcome::WriteFailed
+                    }
+                    crate::interactive_conflict::GuardedApplyOutcome::SkippedChanged => {
+                        skipped_changed_count += 1;
+                        incomplete_reasons.insert(
+                            session_id.clone(),
+                            "local session changed during conflict resolution".to_string(),
+                        );
+                        println!(
+                            "  {} Local session {} changed during conflict resolution; preserved local file",
+                            "!".yellow(),
+                            session_id
+                        );
+                        SuppressionApplyOutcome::SkippedChanged
+                    }
+                    crate::interactive_conflict::GuardedApplyOutcome::KeptLocal => {
+                        completed_sessions.insert(session_id.clone());
+                        incomplete_reasons.remove(session_id);
+                        SuppressionApplyOutcome::Cancelled
+                    }
+                };
+                clear_pending_suppression_after_outcome(
+                    maintenance_store.as_ref(),
+                    &pending_suppression_clears,
+                    &identity,
+                    suppression_outcome,
+                );
             }
+
+            crate::interactive_conflict::update_reported_resolutions(
+                detector.conflicts_mut(),
+                &resolution_result,
+                &applied,
+            );
+            let report = ConflictReport::from_conflicts(detector.conflicts());
+            save_conflict_report(&report)?;
+            applied.renames
         } else {
             // All conflicts resolved via smart merge
             Vec::new()
@@ -1022,7 +1179,6 @@ pub fn pull_history(
 
     let mut merged_count = 0;
     let mut added_count = 0;
-    let mut modified_count = 0;
     let mut unchanged_count = 0;
     let mut skipped_no_local_match = 0;
     let mut skipped_existing_target = 0;
@@ -1057,6 +1213,10 @@ pub fn pull_history(
                     project_name
                 );
                 skipped_no_local_match += 1;
+                incomplete_reasons.insert(
+                    remote_session.session_id.clone(),
+                    "no matching local project".to_string(),
+                );
                 let identity = SessionIdentity {
                     source: SessionSource::Claude,
                     session_id: remote_session.session_id.clone(),
@@ -1077,6 +1237,10 @@ pub fn pull_history(
                     remote_relative
                 );
                 skipped_no_local_match += 1;
+                incomplete_reasons.insert(
+                    remote_session.session_id.clone(),
+                    "no matching local project".to_string(),
+                );
                 let identity = SessionIdentity {
                     source: SessionSource::Claude,
                     session_id: remote_session.session_id.clone(),
@@ -1103,6 +1267,10 @@ pub fn pull_history(
         if let Err(error) =
             prepare_local_session_destination(&claude_dir, &relative_path_for_tracking)
         {
+            incomplete_reasons.insert(
+                remote_session.session_id.clone(),
+                format!("unsafe local destination: {error}"),
+            );
             let identity = SessionIdentity {
                 source: SessionSource::Claude,
                 session_id: remote_session.session_id.clone(),
@@ -1113,16 +1281,14 @@ pub fn pull_history(
                 &identity,
                 SuppressionApplyOutcome::WriteFailed,
             );
-            return Err(error);
+            continue;
         }
 
         // Determine operation type based on local state
         let operation = if let Some(local) = local_map.get(&remote_session.session_id) {
             if local.content_hash() == remote_session.content_hash() {
-                unchanged_count += 1;
                 SyncOperation::Unchanged
             } else {
-                modified_count += 1;
                 SyncOperation::Modified
             }
         } else {
@@ -1141,6 +1307,8 @@ pub fn pull_history(
                 Ok(AddedSessionWriteOutcome::Written(_)) => {
                     added_count += 1;
                     merged_count += 1;
+                    completed_sessions.insert(remote_session.session_id.clone());
+                    incomplete_reasons.remove(&remote_session.session_id);
                 }
                 Ok(AddedSessionWriteOutcome::SkippedExisting(destination)) => {
                     log::warn!(
@@ -1149,6 +1317,10 @@ pub fn pull_history(
                         destination.display()
                     );
                     skipped_existing_target += 1;
+                    incomplete_reasons.insert(
+                        remote_session.session_id.clone(),
+                        "existing local target was not safely discoverable".to_string(),
+                    );
                     let identity = SessionIdentity {
                         source: SessionSource::Claude,
                         session_id: remote_session.session_id.clone(),
@@ -1162,6 +1334,10 @@ pub fn pull_history(
                     continue;
                 }
                 Err(error) => {
+                    incomplete_reasons.insert(
+                        remote_session.session_id.clone(),
+                        format!("Added write failed: {error}"),
+                    );
                     let identity = SessionIdentity {
                         source: SessionSource::Claude,
                         session_id: remote_session.session_id.clone(),
@@ -1172,15 +1348,50 @@ pub fn pull_history(
                         &identity,
                         SuppressionApplyOutcome::WriteFailed,
                     );
-                    return Err(error);
+                    continue;
                 }
             }
         } else if operation == SyncOperation::Modified {
-            if let Err(error) = write_session_within_local_root(
+            // Any differing session present on both sides should have been a
+            // conflict. Treat reaching this branch as an invariant failure and
+            // preserve the local file rather than overwriting it.
+            log::warn!(
+                "Skipping non-conflict Modified session {} to preserve the local file",
+                remote_session.session_id
+            );
+            skipped_changed_count += 1;
+            incomplete_reasons.insert(
+                remote_session.session_id.clone(),
+                "unexpected non-conflict Modified classification".to_string(),
+            );
+            let identity = SessionIdentity {
+                source: SessionSource::Claude,
+                session_id: remote_session.session_id.clone(),
+            };
+            clear_pending_suppression_after_outcome(
+                maintenance_store.as_ref(),
+                &pending_suppression_clears,
+                &identity,
+                SuppressionApplyOutcome::SkippedChanged,
+            );
+            continue;
+        }
+
+        if operation == SyncOperation::Unchanged {
+            let Some(discovery_local) = local_map.get(&remote_session.session_id) else {
+                unreachable!("Unchanged session must have a discovery baseline")
+            };
+            if !revalidate_unchanged_session(
+                discovery_local,
                 remote_session,
                 &claude_dir,
                 &relative_path_for_tracking,
-            ) {
+            )? {
+                skipped_changed_count += 1;
+                incomplete_reasons.insert(
+                    remote_session.session_id.clone(),
+                    "local session changed before Unchanged revalidation".to_string(),
+                );
                 let identity = SessionIdentity {
                     source: SessionSource::Claude,
                     session_id: remote_session.session_id.clone(),
@@ -1189,11 +1400,13 @@ pub fn pull_history(
                     maintenance_store.as_ref(),
                     &pending_suppression_clears,
                     &identity,
-                    SuppressionApplyOutcome::WriteFailed,
+                    SuppressionApplyOutcome::SkippedChanged,
                 );
-                return Err(error);
+                continue;
             }
-            merged_count += 1;
+            unchanged_count += 1;
+            completed_sessions.insert(remote_session.session_id.clone());
+            incomplete_reasons.remove(&remote_session.session_id);
         }
 
         let identity = SessionIdentity {
@@ -1226,6 +1439,31 @@ pub fn pull_history(
     }
 
     println!("  {} Merged {} sessions", "✓".green(), merged_count);
+
+    let protected_entries = incomplete_reasons
+        .iter()
+        .filter_map(|(session_id, reason)| {
+            remote_revisions
+                .get(session_id)
+                .map(|(relative, fingerprint)| PullGuardEntry {
+                    session_id: session_id.clone(),
+                    remote_relative_path: relative.clone(),
+                    remote_fingerprint: fingerprint.clone(),
+                    reason: reason.clone(),
+                })
+        })
+        .collect::<Vec<_>>();
+    let completed_entries = completed_sessions
+        .iter()
+        .filter_map(|session_id| {
+            remote_revisions
+                .get(session_id)
+                .map(|(relative, fingerprint)| {
+                    (session_id.clone(), relative.clone(), fingerprint.clone())
+                })
+        })
+        .collect::<Vec<_>>();
+    PullGuardRegistry::reconcile(protected_entries, completed_entries)?;
 
     // ============================================================================
     // CREATE AND SAVE OPERATION RECORD
@@ -1262,11 +1500,11 @@ pub fn pull_history(
     // Show operation statistics
     let conflict_count = detector.conflict_count();
     let stats_msg = format!(
-        "  {} Added    {} Modified    {} Conflicts    {} Unchanged",
+        "  {} Added    {} Conflicts    {} Unchanged    {} Deferred",
         format!("{added_count}").green(),
-        format!("{modified_count}").cyan(),
         format!("{conflict_count}").yellow(),
         format!("{unchanged_count}").dimmed(),
+        format!("{skipped_changed_count}").cyan(),
     );
     println!("{stats_msg}");
     if filter.use_project_name_only && skipped_no_local_match > 0 {
@@ -1281,6 +1519,13 @@ pub fn pull_history(
             "  {} Skipped (existing local target): {}",
             "!".yellow(),
             skipped_existing_target
+        );
+    }
+    if skipped_changed_count > 0 {
+        println!(
+            "  {} Skipped (local session changed or unsafe baseline): {}",
+            "!".yellow(),
+            skipped_changed_count
         );
     }
     println!();
@@ -1389,6 +1634,15 @@ pub fn pull_history(
         if let Err(e) = crate::handlers::config_sync::auto_apply_claude_md(&filter.config_sync) {
             log::debug!("Failed to auto-apply CLAUDE.md: {}", e);
         }
+    }
+
+    if !incomplete_reasons.is_empty() {
+        let mut sessions = incomplete_reasons
+            .into_iter()
+            .map(|(session_id, reason)| PullIncompleteSession { session_id, reason })
+            .collect::<Vec<_>>();
+        sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        return Err(PullIncomplete { sessions }.into());
     }
 
     Ok(())
@@ -1533,6 +1787,9 @@ mod tests {
         assert!(!should_clear_suppression(
             SuppressionApplyOutcome::WriteFailed
         ));
+        assert!(!should_clear_suppression(
+            SuppressionApplyOutcome::SkippedChanged
+        ));
     }
 
     #[test]
@@ -1596,6 +1853,7 @@ mod tests {
             SuppressionApplyOutcome::Cancelled,
             SuppressionApplyOutcome::SkippedNoLocalProject,
             SuppressionApplyOutcome::WriteFailed,
+            SuppressionApplyOutcome::SkippedChanged,
             SuppressionApplyOutcome::SkippedExistingTarget,
         ] {
             clear_pending_suppression_after_outcome(Some(&store), &pending, &identity, outcome);
@@ -1641,27 +1899,6 @@ mod tests {
             device: "test".to_string(),
             reason: crate::sync::tombstone::DeleteReason::Explicit,
         }
-    }
-
-    #[test]
-    fn guarded_session_write_creates_normal_destination() {
-        let temp = tempfile::tempdir().unwrap();
-        let local_root = temp.path().join("local");
-        fs::create_dir_all(&local_root).unwrap();
-        let session = ConversationSession {
-            session_id: "session-id".to_string(),
-            entries: Vec::new(),
-            file_path: String::new(),
-        };
-
-        let destination = write_session_within_local_root(
-            &session,
-            &local_root,
-            Path::new("project/session-id.jsonl"),
-        )
-        .unwrap();
-        assert_eq!(destination, local_root.join("project/session-id.jsonl"));
-        assert!(destination.is_file());
     }
 
     fn session_json(session_id: &str, content: &str) -> String {
@@ -1814,12 +2051,6 @@ mod tests {
                 entries: Vec::new(),
                 file_path: String::new(),
             };
-            assert!(write_session_within_local_root(
-                &session,
-                &local_root,
-                Path::new("project/session-id.jsonl"),
-            )
-            .is_err());
             assert!(write_added_session_without_overwrite(
                 &session,
                 &local_root,
@@ -1981,5 +2212,416 @@ mod tests {
             assert!(!local_project.join("memory/secret.md").exists());
             assert_eq!(fs::read(&outside_file).unwrap(), b"must not copy");
         }
+    }
+    #[test]
+    fn smart_merge_uses_snapshot_bytes_instead_of_stale_discovery_session() {
+        fn entry(uuid: &str) -> crate::parser::ConversationEntry {
+            crate::parser::ConversationEntry {
+                entry_type: "user".to_string(),
+                uuid: Some(uuid.to_string()),
+                parent_uuid: None,
+                session_id: Some("session".to_string()),
+                timestamp: None,
+                message: None,
+                cwd: None,
+                version: None,
+                git_branch: None,
+                custom_title: None,
+                extra: serde_json::Value::Null,
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let local_path = temp.path().join("session.jsonl");
+        let stale = ConversationSession {
+            session_id: "session".to_string(),
+            entries: vec![entry("stale-discovery")],
+            file_path: local_path.to_string_lossy().to_string(),
+        };
+        let remote = ConversationSession {
+            session_id: "session".to_string(),
+            entries: vec![entry("remote")],
+            file_path: temp
+                .path()
+                .join("remote.jsonl")
+                .to_string_lossy()
+                .to_string(),
+        };
+        let snapshot_bytes = format!(
+            "{}\n",
+            serde_json::to_string(&entry("snapshot-local")).unwrap()
+        )
+        .into_bytes();
+        std::fs::write(&local_path, &snapshot_bytes).unwrap();
+        let baseline =
+            SessionBaseline::from_snapshot(&local_path, "session", snapshot_bytes).unwrap();
+        let mut conflict = crate::conflict::Conflict::new(&stale, &remote);
+
+        let baseline_session = parse_snapshot_session(&conflict, &baseline).unwrap();
+        conflict
+            .try_smart_merge(&baseline_session, &remote)
+            .unwrap();
+
+        assert_eq!(
+            baseline_session.entries[0].uuid.as_deref(),
+            Some("snapshot-local")
+        );
+        let crate::conflict::ConflictResolution::SmartMerge { merged_entries, .. } =
+            conflict.resolution
+        else {
+            panic!("expected SmartMerge resolution");
+        };
+        let uuids = merged_entries
+            .iter()
+            .filter_map(|entry| entry.uuid.as_deref())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            uuids,
+            std::collections::HashSet::from(["snapshot-local", "remote"])
+        );
+        assert!(!uuids.contains("stale-discovery"));
+    }
+    #[test]
+    fn unchanged_revalidation_detects_local_change_before_state_and_history_updates() {
+        fn entry(uuid: &str) -> crate::parser::ConversationEntry {
+            crate::parser::ConversationEntry {
+                entry_type: "user".to_string(),
+                uuid: Some(uuid.to_string()),
+                parent_uuid: None,
+                session_id: Some("session".to_string()),
+                timestamp: None,
+                message: None,
+                cwd: None,
+                version: None,
+                git_branch: None,
+                custom_title: None,
+                extra: serde_json::Value::Null,
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let relative = Path::new("project/session.jsonl");
+        let target = root.path().join(relative);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let discovery = ConversationSession {
+            session_id: "session".to_string(),
+            entries: vec![entry("same")],
+            file_path: target.to_string_lossy().to_string(),
+        };
+        let remote = discovery.clone();
+        std::fs::write(
+            &target,
+            format!("{}\n", serde_json::to_string(&entry("changed")).unwrap()),
+        )
+        .unwrap();
+
+        assert!(
+            !revalidate_unchanged_session(&discovery, &remote, root.path(), relative,).unwrap()
+        );
+    }
+    #[test]
+    fn automatic_smart_merge_rejects_snapshot_with_different_session_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_path = temp.path().join("session.jsonl");
+        let wrong = b"{\"type\":\"user\",\"uuid\":\"other\",\"sessionId\":\"other-session\"}\n";
+        std::fs::write(&local_path, wrong).unwrap();
+        let baseline =
+            SessionBaseline::from_snapshot(&local_path, "session", wrong.to_vec()).unwrap();
+        let local = ConversationSession {
+            session_id: "session".to_string(),
+            entries: vec![],
+            file_path: local_path.to_string_lossy().to_string(),
+        };
+        let remote = ConversationSession {
+            session_id: "session".to_string(),
+            entries: vec![],
+            file_path: temp
+                .path()
+                .join("remote.jsonl")
+                .to_string_lossy()
+                .to_string(),
+        };
+        let conflict = crate::conflict::Conflict::new(&local, &remote);
+
+        let error = parse_snapshot_session(&conflict, &baseline).unwrap_err();
+        assert!(error.to_string().contains("identity changed"));
+    }
+    #[test]
+    #[serial_test::serial]
+    fn production_append_only_pull_keeps_concurrent_local_entry_visible_and_pushes_union() {
+        struct EnvGuard {
+            home: Option<std::ffi::OsString>,
+            userprofile: Option<std::ffi::OsString>,
+            config: Option<std::ffi::OsString>,
+        }
+        impl EnvGuard {
+            fn set(home: &Path, config: &Path) -> Self {
+                let guard = Self {
+                    home: std::env::var_os("HOME"),
+                    userprofile: std::env::var_os("USERPROFILE"),
+                    config: std::env::var_os(crate::config::CONFIG_DIR_ENV),
+                };
+                std::env::set_var("HOME", home);
+                std::env::set_var("USERPROFILE", home);
+                std::env::set_var(crate::config::CONFIG_DIR_ENV, config);
+                guard
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (name, value) in [
+                    ("HOME", self.home.take()),
+                    ("USERPROFILE", self.userprofile.take()),
+                    (crate::config::CONFIG_DIR_ENV, self.config.take()),
+                ] {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let config = temp.path().join("config");
+        let repo_path = temp.path().join("repo");
+        let local_file = home.join(".claude/projects/project/session.jsonl");
+        let remote_file = repo_path.join("projects/project/session.jsonl");
+        std::fs::create_dir_all(local_file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(remote_file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let _guard = EnvGuard::set(&home, &config);
+
+        let line = |uuid: &str, parent: Option<&str>| {
+            serde_json::json!({
+                "type": "user",
+                "uuid": uuid,
+                "parentUuid": parent,
+                "sessionId": "session",
+                "cwd": "/tmp/project",
+                "message": {"role": "user", "content": uuid}
+            })
+            .to_string()
+        };
+        let local_bytes = format!("{}\n", line("a", None));
+        let remote_bytes = format!("{}\n{}\n", line("a", None), line("b", Some("a")));
+        std::fs::write(&local_file, &local_bytes).unwrap();
+        std::fs::write(&remote_file, &remote_bytes).unwrap();
+
+        crate::scm::init(&repo_path).unwrap();
+        let repo = crate::scm::open(&repo_path).unwrap();
+        repo.stage_all().unwrap();
+        repo.commit("remote baseline").unwrap();
+        SyncState {
+            sync_repo_path: repo_path.clone(),
+            has_remote: false,
+            is_cloned_repo: false,
+            last_synced_commit: None,
+        }
+        .save()
+        .unwrap();
+        let mut filter = FilterConfig {
+            use_project_name_only: false,
+            ..FilterConfig::default()
+        };
+        filter.session_maintenance.enabled = false;
+        filter.config_sync.enabled = false;
+        filter.auto_memory.enabled = false;
+        filter.save().unwrap();
+        std::fs::write(
+            config.join("config.toml"),
+            "[session_maintenance]\nenabled = false\n",
+        )
+        .unwrap();
+
+        let changed_path = local_file.clone();
+        let concurrent_line = line("c", Some("a"));
+        set_after_snapshot_hook(move || {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&changed_path)
+                .unwrap();
+            writeln!(file, "{concurrent_line}").unwrap();
+            file.sync_all().unwrap();
+        });
+
+        pull_history(false, None, false, crate::VerbosityLevel::Quiet).unwrap();
+
+        let local_contents = std::fs::read_to_string(&local_file).unwrap();
+        assert!(local_contents.contains("\"b\""));
+        assert!(local_contents.contains("\"c\""));
+        let history: OperationHistory =
+            serde_json::from_slice(&std::fs::read(config.join("operation-history.json")).unwrap())
+                .unwrap();
+        assert!(history.operations.iter().any(|operation| {
+            operation
+                .affected_conversations
+                .iter()
+                .any(|conversation| conversation.operation == SyncOperation::Conflict)
+        }));
+
+        crate::sync::push_history(
+            None,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            crate::VerbosityLevel::Quiet,
+        )
+        .unwrap();
+        let remote_contents = std::fs::read_to_string(&remote_file).unwrap();
+        assert!(remote_contents.contains("\"b\""));
+        assert!(remote_contents.contains("\"c\""));
+
+        let guard = PullGuardRegistry::load().unwrap();
+        assert!(!guard
+            .suppresses_push("session", Path::new("project/session.jsonl"), &remote_file)
+            .unwrap());
+
+        let remote_r2 = std::fs::read(&remote_file).unwrap();
+        PullGuardRegistry::reconcile(
+            [PullGuardEntry {
+                session_id: "session".to_string(),
+                remote_relative_path: PathBuf::from("project/session.jsonl"),
+                remote_fingerprint: blake3::hash(b"older remote R1").to_hex().to_string(),
+                reason: "R1 pull incomplete".to_string(),
+            }],
+            [],
+        )
+        .unwrap();
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&local_file)
+                .unwrap();
+            writeln!(file, "{}", line("e", Some("c"))).unwrap();
+            file.sync_all().unwrap();
+        }
+        crate::sync::push_history(
+            None,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            crate::VerbosityLevel::Quiet,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&remote_file).unwrap(), remote_r2);
+        assert!(PullGuardRegistry::load()
+            .unwrap()
+            .suppresses_push("session", Path::new("project/session.jsonl"), &remote_file)
+            .unwrap());
+    }
+    #[test]
+    #[serial_test::serial]
+    fn production_unchanged_revalidation_defers_mutation_without_history_or_suppression_clear() {
+        struct EnvGuard {
+            home: Option<std::ffi::OsString>,
+            config: Option<std::ffi::OsString>,
+        }
+        impl EnvGuard {
+            fn set(home: &Path, config: &Path) -> Self {
+                let guard = Self {
+                    home: std::env::var_os("HOME"),
+                    config: std::env::var_os(crate::config::CONFIG_DIR_ENV),
+                };
+                std::env::set_var("HOME", home);
+                std::env::set_var(crate::config::CONFIG_DIR_ENV, config);
+                guard
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match self.home.take() {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+                match self.config.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let config = temp.path().join("config");
+        let repo_path = temp.path().join("repo");
+        let local_file = home.join(".claude/projects/project/session.jsonl");
+        let remote_file = repo_path.join("projects/project/session.jsonl");
+        std::fs::create_dir_all(local_file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(remote_file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let _guard = EnvGuard::set(&home, &config);
+        let baseline = serde_json::json!({
+            "type": "user",
+            "uuid": "same",
+            "sessionId": "session",
+            "cwd": "/tmp/project",
+            "message": {"role": "user", "content": "same"}
+        })
+        .to_string();
+        std::fs::write(&local_file, format!("{baseline}\n")).unwrap();
+        std::fs::write(&remote_file, format!("{baseline}\n")).unwrap();
+        crate::scm::init(&repo_path).unwrap();
+        let repo = crate::scm::open(&repo_path).unwrap();
+        repo.stage_all().unwrap();
+        repo.commit("same baseline").unwrap();
+        SyncState {
+            sync_repo_path: repo_path.clone(),
+            has_remote: false,
+            is_cloned_repo: false,
+            last_synced_commit: None,
+        }
+        .save()
+        .unwrap();
+        let mut filter = FilterConfig {
+            use_project_name_only: false,
+            ..FilterConfig::default()
+        };
+        filter.session_maintenance.enabled = false;
+        filter.config_sync.enabled = false;
+        filter.auto_memory.enabled = false;
+        filter.save().unwrap();
+        std::fs::write(
+            config.join("config.toml"),
+            "[session_maintenance]\nenabled = false\n",
+        )
+        .unwrap();
+
+        let changed_path = local_file.clone();
+        set_after_snapshot_hook(move || {
+            use std::io::Write;
+            let changed = serde_json::json!({
+                "type": "user",
+                "uuid": "changed",
+                "parentUuid": "same",
+                "sessionId": "session",
+                "cwd": "/tmp/project"
+            });
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(changed_path)
+                .unwrap();
+            writeln!(file, "{changed}").unwrap();
+            file.sync_all().unwrap();
+        });
+
+        let error = pull_history(false, None, false, crate::VerbosityLevel::Quiet).unwrap_err();
+        assert!(error.downcast_ref::<PullIncomplete>().is_some());
+        assert!(std::fs::read_to_string(&local_file)
+            .unwrap()
+            .contains("changed"));
+        let history = OperationHistory::load().unwrap();
+        assert!(history.operations[0].affected_conversations.is_empty());
+        assert!(PullGuardRegistry::load()
+            .unwrap()
+            .suppresses_push("session", Path::new("project/session.jsonl"), &remote_file)
+            .unwrap());
     }
 }

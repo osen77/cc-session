@@ -433,3 +433,253 @@ fn test_mixed_uuid_and_non_uuid_entries() {
         "Should use timestamp merging for non-UUID entries"
     );
 }
+
+#[test]
+fn preserves_missing_parent_orphan_subtree_without_reparenting() {
+    let local = ConversationSession {
+        session_id: "test".to_string(),
+        file_path: "local.jsonl".to_string(),
+        entries: vec![
+            create_entry("root", None, "2025-01-01T00:00:00Z", "root"),
+            create_entry(
+                "orphan",
+                Some("missing-parent"),
+                "2025-01-01T00:01:00Z",
+                "orphan",
+            ),
+            create_entry(
+                "orphan-child",
+                Some("orphan"),
+                "2025-01-01T00:02:00Z",
+                "orphan child",
+            ),
+        ],
+    };
+    let remote = ConversationSession {
+        session_id: "test".to_string(),
+        file_path: "remote.jsonl".to_string(),
+        entries: vec![],
+    };
+
+    let result = merge_conversations(&local, &remote).unwrap();
+    let uuids = result
+        .merged_entries
+        .iter()
+        .filter_map(|entry| entry.uuid.as_deref())
+        .collect::<Vec<_>>();
+
+    assert_eq!(uuids, vec!["root", "orphan", "orphan-child"]);
+    assert_eq!(
+        result.merged_entries[1].parent_uuid.as_deref(),
+        Some("missing-parent")
+    );
+    assert_eq!(result.stats.expected_uuid_count, 3);
+    assert_eq!(result.stats.emitted_uuid_count, 3);
+    assert_eq!(result.stats.orphan_roots_preserved, 1);
+}
+
+#[test]
+fn preserves_multiple_orphan_branches_and_cross_side_parent_links() {
+    let local = ConversationSession {
+        session_id: "test".to_string(),
+        file_path: "local.jsonl".to_string(),
+        entries: vec![
+            create_entry(
+                "child",
+                Some("remote-parent"),
+                "2025-01-01T00:02:00Z",
+                "child",
+            ),
+            create_entry("orphan-a", Some("missing-a"), "2025-01-01T00:03:00Z", "a"),
+            create_entry("orphan-b", Some("missing-b"), "2025-01-01T00:04:00Z", "b"),
+        ],
+    };
+    let remote = ConversationSession {
+        session_id: "test".to_string(),
+        file_path: "remote.jsonl".to_string(),
+        entries: vec![create_entry(
+            "remote-parent",
+            None,
+            "2025-01-01T00:01:00Z",
+            "parent",
+        )],
+    };
+
+    let result = merge_conversations(&local, &remote).unwrap();
+    let uuids = result
+        .merged_entries
+        .iter()
+        .filter_map(|entry| entry.uuid.as_deref())
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(
+        uuids,
+        std::collections::HashSet::from(["remote-parent", "child", "orphan-a", "orphan-b"])
+    );
+    assert_eq!(result.stats.expected_uuid_count, 4);
+    assert_eq!(result.stats.emitted_uuid_count, 4);
+    assert_eq!(result.stats.orphan_roots_preserved, 2);
+}
+
+#[test]
+fn rejects_self_and_multi_node_parent_cycles() {
+    for entries in [
+        vec![create_entry(
+            "self",
+            Some("self"),
+            "2025-01-01T00:00:00Z",
+            "self",
+        )],
+        vec![
+            create_entry("a", Some("b"), "2025-01-01T00:00:00Z", "a"),
+            create_entry("b", Some("c"), "2025-01-01T00:01:00Z", "b"),
+            create_entry("c", Some("a"), "2025-01-01T00:02:00Z", "c"),
+        ],
+    ] {
+        let local = ConversationSession {
+            session_id: "test".to_string(),
+            file_path: "local.jsonl".to_string(),
+            entries,
+        };
+        let remote = ConversationSession {
+            session_id: "test".to_string(),
+            file_path: "remote.jsonl".to_string(),
+            entries: vec![],
+        };
+
+        let error = merge_conversations(&local, &remote).unwrap_err();
+        assert!(error.to_string().contains("circular parentUuid"));
+    }
+}
+
+#[test]
+fn equal_and_missing_timestamps_have_deterministic_uuid_order() {
+    let mut no_timestamp_b = create_entry("b", None, "unused", "b");
+    no_timestamp_b.timestamp = None;
+    let mut no_timestamp_a = create_entry("a", None, "unused", "a");
+    no_timestamp_a.timestamp = None;
+    let local = ConversationSession {
+        session_id: "test".to_string(),
+        file_path: "local.jsonl".to_string(),
+        entries: vec![
+            no_timestamp_b,
+            no_timestamp_a,
+            create_entry("same-b", None, "2025-01-01T00:00:00Z", "same b"),
+            create_entry("same-a", None, "2025-01-01T00:00:00Z", "same a"),
+        ],
+    };
+    let remote = ConversationSession {
+        session_id: "test".to_string(),
+        file_path: "remote.jsonl".to_string(),
+        entries: vec![],
+    };
+
+    let expected = merge_conversations(&local, &remote)
+        .unwrap()
+        .merged_entries
+        .iter()
+        .map(|entry| entry.uuid.clone().unwrap())
+        .collect::<Vec<_>>();
+    for _ in 0..20 {
+        let actual = merge_conversations(&local, &remote)
+            .unwrap()
+            .merged_entries
+            .iter()
+            .map(|entry| entry.uuid.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+    assert_eq!(expected, vec!["b", "a", "same-b", "same-a"]);
+}
+
+#[test]
+fn rejects_conflicting_duplicate_uuid_on_the_same_side() {
+    let local = ConversationSession {
+        session_id: "test".to_string(),
+        file_path: "local.jsonl".to_string(),
+        entries: vec![
+            create_entry("dup", None, "2025-01-01T00:00:00Z", "first"),
+            create_entry(
+                "dup",
+                Some("different-parent"),
+                "2025-01-01T00:01:00Z",
+                "second",
+            ),
+        ],
+    };
+    let remote = ConversationSession {
+        session_id: "test".to_string(),
+        file_path: "remote.jsonl".to_string(),
+        entries: vec![],
+    };
+
+    let error = merge_conversations(&local, &remote).unwrap_err();
+    assert!(error.to_string().contains("duplicate UUID dup"));
+}
+
+#[test]
+fn explicitly_deduplicates_identical_same_side_uuid_entries() {
+    let duplicate = create_entry("dup", None, "2025-01-01T00:00:00Z", "same");
+    let local = ConversationSession {
+        session_id: "test".to_string(),
+        file_path: "local.jsonl".to_string(),
+        entries: vec![duplicate.clone(), duplicate],
+    };
+    let remote = ConversationSession {
+        session_id: "test".to_string(),
+        file_path: "remote.jsonl".to_string(),
+        entries: vec![],
+    };
+
+    let result = merge_conversations(&local, &remote).unwrap();
+    assert_eq!(result.merged_entries.len(), 1);
+    assert_eq!(result.stats.duplicates_removed, 1);
+}
+
+#[test]
+fn merges_twenty_thousand_deep_parent_chain_without_recursion() {
+    let entries = (0..20_000)
+        .map(|index| {
+            create_entry(
+                &format!("node-{index:05}"),
+                (index > 0)
+                    .then(|| format!("node-{:05}", index - 1))
+                    .as_deref(),
+                &format!("2025-01-01T00:{:05}:00Z", index),
+                "deep",
+            )
+        })
+        .collect();
+    let local = ConversationSession {
+        session_id: "test".to_string(),
+        file_path: "local.jsonl".to_string(),
+        entries,
+    };
+    let remote = ConversationSession {
+        session_id: "test".to_string(),
+        file_path: "remote.jsonl".to_string(),
+        entries: vec![],
+    };
+
+    let result = merge_conversations(&local, &remote).unwrap();
+    assert_eq!(result.stats.expected_uuid_count, 20_000);
+    assert_eq!(result.stats.emitted_uuid_count, 20_000);
+    assert_eq!(result.merged_entries.len(), 20_000);
+}
+
+#[test]
+fn merge_stats_deserializes_legacy_payload_with_new_fields_defaulted() {
+    let stats: claude_code_sync::merge::MergeStats = serde_json::from_value(json!({
+        "local_messages": 1,
+        "remote_messages": 2,
+        "merged_messages": 3,
+        "duplicates_removed": 0,
+        "edits_resolved": 0,
+        "branches_detected": 0,
+        "timestamp_merged": 0
+    }))
+    .unwrap();
+    assert_eq!(stats.expected_uuid_count, 0);
+    assert_eq!(stats.emitted_uuid_count, 0);
+    assert_eq!(stats.orphan_roots_preserved, 0);
+}

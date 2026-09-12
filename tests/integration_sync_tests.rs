@@ -50,17 +50,19 @@ impl Drop for HomeEnvGuard {
 #[serial]
 fn config_env_guard_restores_previous_value() {
     let previous = std::env::var_os(CONFIG_DIR_ENV);
-    std::env::set_var(CONFIG_DIR_ENV, "pre-existing-config");
+    let pre_existing = tempfile::tempdir().unwrap();
+    let temporary = tempfile::tempdir().unwrap();
+    std::env::set_var(CONFIG_DIR_ENV, pre_existing.path());
     {
-        let _guard = ConfigEnvGuard::set(Path::new("temporary-config"));
+        let _guard = ConfigEnvGuard::set(temporary.path());
         assert_eq!(
             std::env::var_os(CONFIG_DIR_ENV).as_deref(),
-            Some(std::ffi::OsStr::new("temporary-config"))
+            Some(temporary.path().as_os_str())
         );
     }
     assert_eq!(
         std::env::var_os(CONFIG_DIR_ENV).as_deref(),
-        Some(std::ffi::OsStr::new("pre-existing-config"))
+        Some(pre_existing.path().as_os_str())
     );
     if let Some(previous) = previous {
         std::env::set_var(CONFIG_DIR_ENV, previous);

@@ -102,7 +102,7 @@ pub struct Conflict {
 /// - **SmartMerge**: Intelligently combines both versions by merging non-conflicting changes
 /// - **KeepBoth**: Preserves both versions by renaming the remote file to avoid overwriting
 /// - **KeepLocal**: Discards the remote version and keeps only the local version
-/// - **KeepRemote**: Discards the local version and keeps only the remote version
+/// - **KeepRemote**: Records a remote-preference request; guarded application saves the remote as a separate conflict copy and leaves the active local file unchanged
 /// - **Pending**: No resolution has been chosen yet (default state for new conflicts)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ConflictResolution {
@@ -111,7 +111,8 @@ pub enum ConflictResolution {
     /// This strategy attempts to combine messages from both local and remote versions
     /// by analyzing message UUIDs, parent relationships, and timestamps. It can handle:
     /// - Non-overlapping messages (simple merge)
-    /// - Edited messages (resolved by timestamp)
+    /// - Edited messages (resolved conceptually by timestamp; automatic application
+    ///   fails closed if that would rewrite an existing local entry)
     /// - Conversation branches (all branches preserved)
     /// - Entries without UUIDs (merged by timestamp)
     ///
@@ -157,10 +158,12 @@ pub enum ConflictResolution {
     /// is not saved to disk.
     KeepLocal,
 
-    /// Keep only the remote version and discard the local version.
+    /// Request the remote version without overwriting the active local file.
     ///
-    /// This strategy assumes the remote version is correct and should replace the
-    /// local version. The local file will be overwritten with the remote content.
+    /// Existing Claude Code session files may still have open writers, so guarded
+    /// application does not replace their inode. The remote content is saved as a
+    /// separate no-clobber conflict copy and the applied report becomes KeepBoth
+    /// or Pending. This variant is retained for source and serialized compatibility.
     KeepRemote,
 
     /// The conflict has not yet been resolved.

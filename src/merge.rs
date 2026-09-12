@@ -3,54 +3,6 @@ use std::collections::{HashMap, HashSet};
 
 use crate::parser::{ConversationEntry, ConversationSession};
 
-/// Represents a node in the conversation message tree.
-///
-/// Each node contains a conversation entry and can have multiple children,
-/// allowing for branching conversations where a single message has multiple
-/// different continuations (e.g., when edited on different machines).
-#[derive(Debug, Clone)]
-pub struct MessageNode {
-    /// The conversation entry for this node
-    pub entry: ConversationEntry,
-
-    /// Child nodes (messages that have this message as their parent)
-    pub children: Vec<MessageNode>,
-}
-
-impl MessageNode {
-    /// Creates a new message node with no children
-    fn new(entry: ConversationEntry) -> Self {
-        MessageNode {
-            entry,
-            children: Vec::new(),
-        }
-    }
-
-    /// Adds a child node to this message
-    fn add_child(&mut self, child: MessageNode) {
-        self.children.push(child);
-    }
-
-    /// Recursively collects all entries in this subtree in depth-first order
-    fn collect_entries(&self) -> Vec<ConversationEntry> {
-        let mut entries = vec![self.entry.clone()];
-
-        // Sort children by timestamp to maintain chronological order
-        let mut sorted_children = self.children.clone();
-        sorted_children.sort_by(|a, b| {
-            let a_ts = a.entry.timestamp.as_ref();
-            let b_ts = b.entry.timestamp.as_ref();
-            a_ts.cmp(&b_ts)
-        });
-
-        for child in &sorted_children {
-            entries.extend(child.collect_entries());
-        }
-
-        entries
-    }
-}
-
 /// Result of a smart merge operation
 #[derive(Debug)]
 pub struct MergeResult {
@@ -84,6 +36,18 @@ pub struct MergeStats {
 
     /// Number of entries merged by timestamp (non-UUID entries)
     pub timestamp_merged: usize,
+
+    /// Number of unique UUID entries expected from the input union.
+    #[serde(default)]
+    pub expected_uuid_count: usize,
+
+    /// Number of unique UUID entries emitted by the tree traversal.
+    #[serde(default)]
+    pub emitted_uuid_count: usize,
+
+    /// Number of roots retained even though their parent UUID was missing.
+    #[serde(default)]
+    pub orphan_roots_preserved: usize,
 }
 
 /// Smart merger for combining conversation sessions
@@ -110,8 +74,8 @@ impl<'a> SmartMerger<'a> {
         self.stats.remote_messages = self.remote.message_count();
 
         // Build UUID maps for both sessions
-        let local_map = self.build_uuid_map(&self.local.entries);
-        let remote_map = self.build_uuid_map(&self.remote.entries);
+        let local_map = self.build_uuid_map(&self.local.entries, "local")?;
+        let remote_map = self.build_uuid_map(&self.remote.entries, "remote")?;
 
         // Detect and resolve edits (same UUID, different content)
         let resolved_edits = self.detect_and_resolve_edits(&local_map, &remote_map)?;
@@ -128,13 +92,26 @@ impl<'a> SmartMerger<'a> {
         all_uuid_entries.extend(local_uuid_entries);
         all_uuid_entries.extend(remote_uuid_entries);
 
-        // Build a single unified tree from all entries
-        let merged_roots = self.build_unified_tree(&all_uuid_entries, &resolved_edits)?;
+        // Build one deterministic, non-recursive traversal from all entries.
+        let mut merged_entries = self.build_unified_tree(&all_uuid_entries, &resolved_edits)?;
 
-        // Flatten tree back to entries
-        let mut merged_entries = Vec::new();
-        for root in &merged_roots {
-            merged_entries.extend(root.collect_entries());
+        // Verify UUID conservation before accepting the smart merge.
+        let expected_uuids: HashSet<String> =
+            local_map.keys().chain(remote_map.keys()).cloned().collect();
+        let emitted_uuids: Vec<String> = merged_entries
+            .iter()
+            .filter_map(|entry| entry.uuid.clone())
+            .collect();
+        let emitted_set: HashSet<String> = emitted_uuids.iter().cloned().collect();
+        self.stats.expected_uuid_count = expected_uuids.len();
+        self.stats.emitted_uuid_count = emitted_uuids.len();
+        if emitted_uuids.len() != emitted_set.len() || emitted_set != expected_uuids {
+            return Err(anyhow!(
+                "smart merge UUID integrity check failed: expected {} unique UUIDs, emitted {} entries / {} unique UUIDs",
+                expected_uuids.len(),
+                emitted_uuids.len(),
+                emitted_set.len()
+            ));
         }
 
         // Merge non-UUID entries by timestamp
@@ -160,12 +137,29 @@ impl<'a> SmartMerger<'a> {
         })
     }
 
-    /// Builds a UUID to entry map
-    fn build_uuid_map(&self, entries: &[ConversationEntry]) -> HashMap<String, ConversationEntry> {
-        entries
-            .iter()
-            .filter_map(|e| e.uuid.as_ref().map(|uuid| (uuid.clone(), e.clone())))
-            .collect()
+    /// Builds a UUID map with first-entry canonical semantics. Identical
+    /// same-side duplicates are explicitly deduplicated; conflicting duplicates
+    /// fail closed before tree construction.
+    fn build_uuid_map(
+        &mut self,
+        entries: &[ConversationEntry],
+        side: &str,
+    ) -> Result<HashMap<String, ConversationEntry>> {
+        let mut map = HashMap::new();
+        for entry in entries {
+            let Some(uuid) = &entry.uuid else {
+                continue;
+            };
+            if let Some(existing) = map.get(uuid) {
+                if serde_json::to_value(existing)? != serde_json::to_value(entry)? {
+                    return Err(anyhow!("conflicting duplicate UUID {uuid} on {side} side"));
+                }
+                self.stats.duplicates_removed += 1;
+                continue;
+            }
+            map.insert(uuid.clone(), entry.clone());
+        }
+        Ok(map)
     }
 
     /// Detects edits (same UUID, different content) and resolves them by timestamp
@@ -225,274 +219,112 @@ impl<'a> SmartMerger<'a> {
         }
     }
 
-    /// Builds a unified tree from all entries (both local and remote)
+    /// Builds a deterministic depth-first ordering without recursive descent.
     fn build_unified_tree(
         &mut self,
         all_entries: &[&ConversationEntry],
         resolved_edits: &HashMap<String, ConversationEntry>,
-    ) -> Result<Vec<MessageNode>> {
-        // Build UUID map, preferring resolved edits and deduplicating
-        let mut uuid_to_entry: HashMap<String, ConversationEntry> = HashMap::new();
+    ) -> Result<Vec<ConversationEntry>> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum VisitState {
+            Visiting,
+            Visited,
+        }
 
-        for entry in all_entries {
+        let mut uuid_to_entry: HashMap<String, ConversationEntry> = HashMap::new();
+        let mut ordinals: HashMap<String, usize> = HashMap::new();
+        for (ordinal, entry) in all_entries.iter().enumerate() {
             if let Some(uuid) = &entry.uuid {
-                // Only insert if not already present (avoids duplicates)
-                if !uuid_to_entry.contains_key(uuid) {
-                    // Use resolved edit if available, otherwise use original entry
-                    let entry_to_use = resolved_edits.get(uuid).unwrap_or(*entry);
-                    uuid_to_entry.insert(uuid.clone(), entry_to_use.clone());
-                }
+                ordinals.entry(uuid.clone()).or_insert(ordinal);
+                uuid_to_entry
+                    .entry(uuid.clone())
+                    .or_insert_with(|| resolved_edits.get(uuid).unwrap_or(*entry).clone());
             }
         }
 
-        // Map parent UUID -> list of child UUIDs
-        let mut parent_to_children: HashMap<Option<String>, Vec<String>> = HashMap::new();
+        let mut all_uuids: Vec<String> = uuid_to_entry.keys().cloned().collect();
+        all_uuids.sort();
+        let mut states: HashMap<String, VisitState> = HashMap::new();
+        for start_uuid in &all_uuids {
+            if states.get(start_uuid) == Some(&VisitState::Visited) {
+                continue;
+            }
+            let mut path = Vec::new();
+            let mut current = start_uuid.clone();
+            loop {
+                match states.get(&current) {
+                    Some(VisitState::Visiting) => {
+                        return Err(anyhow!(
+                            "circular parentUuid relationship detected at UUID {current}"
+                        ));
+                    }
+                    Some(VisitState::Visited) => break,
+                    None => {}
+                }
+                states.insert(current.clone(), VisitState::Visiting);
+                path.push(current.clone());
+                let Some(parent) = uuid_to_entry
+                    .get(&current)
+                    .and_then(|entry| entry.parent_uuid.as_ref())
+                    .filter(|parent| uuid_to_entry.contains_key(*parent))
+                else {
+                    break;
+                };
+                current = parent.clone();
+            }
+            for uuid in path {
+                states.insert(uuid, VisitState::Visited);
+            }
+        }
 
+        let sort_uuids = |uuids: &mut Vec<String>| {
+            uuids.sort_by(|a, b| {
+                let a_entry = &uuid_to_entry[a];
+                let b_entry = &uuid_to_entry[b];
+                a_entry
+                    .timestamp
+                    .cmp(&b_entry.timestamp)
+                    .then_with(|| ordinals[a].cmp(&ordinals[b]))
+                    .then_with(|| a.cmp(b))
+            });
+        };
+
+        let mut parent_to_children: HashMap<String, Vec<String>> = HashMap::new();
+        let mut root_uuids = Vec::new();
+        let mut orphan_roots = 0usize;
         for (uuid, entry) in &uuid_to_entry {
-            parent_to_children
-                .entry(entry.parent_uuid.clone())
-                .or_default()
-                .push(uuid.clone());
-        }
-
-        // Build tree recursively
-        fn build_subtree(
-            uuid: &str,
-            uuid_to_entry: &HashMap<String, ConversationEntry>,
-            parent_to_children: &HashMap<Option<String>, Vec<String>>,
-        ) -> MessageNode {
-            let entry = uuid_to_entry.get(uuid).unwrap().clone();
-            let mut node = MessageNode::new(entry);
-
-            // Get children for this UUID
-            if let Some(child_uuids) = parent_to_children.get(&Some(uuid.to_string())) {
-                for child_uuid in child_uuids {
-                    let child_node = build_subtree(child_uuid, uuid_to_entry, parent_to_children);
-                    node.add_child(child_node);
+            match entry.parent_uuid.as_deref() {
+                Some(parent) if uuid_to_entry.contains_key(parent) => {
+                    parent_to_children
+                        .entry(parent.to_string())
+                        .or_default()
+                        .push(uuid.clone());
                 }
-            }
-
-            node
-        }
-
-        // Find root UUIDs (entries with no parent)
-        let root_uuids = parent_to_children.get(&None).cloned().unwrap_or_default();
-
-        // Build trees from each root
-        let mut roots = Vec::new();
-        for root_uuid in root_uuids {
-            let root_node = build_subtree(&root_uuid, &uuid_to_entry, &parent_to_children);
-            roots.push(root_node);
-        }
-
-        // Count branches
-        for entry in uuid_to_entry.values() {
-            if let Some(children) = parent_to_children.get(&Some(entry.uuid.clone().unwrap())) {
-                if children.len() > 1 {
-                    self.stats.branches_detected += 1;
+                Some(_) => {
+                    orphan_roots += 1;
+                    root_uuids.push(uuid.clone());
                 }
+                None => root_uuids.push(uuid.clone()),
             }
         }
-
-        // Sort roots by timestamp
-        roots.sort_by(|a, b| {
-            let a_ts = a.entry.timestamp.as_ref();
-            let b_ts = b.entry.timestamp.as_ref();
-            a_ts.cmp(&b_ts)
-        });
-
-        Ok(roots)
-    }
-
-    /// Builds a message tree from entries
-    #[allow(dead_code)]
-    fn build_tree(
-        &mut self,
-        entries: &[&ConversationEntry],
-        resolved_edits: &HashMap<String, ConversationEntry>,
-    ) -> Result<Vec<MessageNode>> {
-        // Build UUID map, preferring resolved edits
-        let mut uuid_to_entry: HashMap<String, ConversationEntry> = HashMap::new();
-
-        for entry in entries {
-            if let Some(uuid) = &entry.uuid {
-                // Use resolved edit if available, otherwise use original entry
-                let entry_to_use = resolved_edits.get(uuid).unwrap_or(*entry);
-                uuid_to_entry.insert(uuid.clone(), entry_to_use.clone());
-            }
-        }
-
-        // Track which UUIDs have been used as children
-        let mut used_as_child = HashSet::new();
-
-        // Map parent UUID -> list of child nodes
-        let mut parent_to_children: HashMap<Option<String>, Vec<MessageNode>> = HashMap::new();
-
-        for entry in uuid_to_entry.values() {
-            let node = MessageNode::new(entry.clone());
-
-            parent_to_children
-                .entry(entry.parent_uuid.clone())
-                .or_default()
-                .push(node);
-
-            if let Some(parent_uuid) = &entry.parent_uuid {
-                used_as_child.insert(parent_uuid.clone());
-            }
-        }
-
-        // Build tree recursively
-        fn build_subtree(
-            parent_uuid: Option<String>,
-            parent_to_children: &HashMap<Option<String>, Vec<MessageNode>>,
-        ) -> Vec<MessageNode> {
-            if let Some(children) = parent_to_children.get(&parent_uuid) {
-                children
-                    .iter()
-                    .map(|child| {
-                        let mut node = child.clone();
-                        let child_uuid = child.entry.uuid.clone();
-                        node.children = build_subtree(child_uuid, parent_to_children);
-                        node
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        }
-
-        // Find root nodes (entries with no parent or parent not in this tree)
-        let roots = build_subtree(None, &parent_to_children);
-
-        // Also find orphaned subtrees (entries whose parent exists but isn't in our tree)
-        let mut all_roots = roots;
-        for (parent_uuid, children) in parent_to_children.iter() {
-            if let Some(parent) = parent_uuid {
-                if !uuid_to_entry.contains_key(parent) {
-                    all_roots.extend(children.iter().map(|child| {
-                        let mut node = child.clone();
-                        let child_uuid = child.entry.uuid.clone();
-                        node.children = build_subtree(child_uuid, &parent_to_children);
-                        node
-                    }));
-                }
-            }
-        }
-
-        Ok(all_roots)
-    }
-
-    /// Merges two message trees, keeping all branches
-    #[allow(dead_code)]
-    fn merge_trees(
-        &mut self,
-        local_roots: Vec<MessageNode>,
-        remote_roots: Vec<MessageNode>,
-    ) -> Result<Vec<MessageNode>> {
-        // Create a map of UUID -> MessageNode for efficient lookup
-        let mut merged_nodes: HashMap<String, MessageNode> = HashMap::new();
-
-        // Process all nodes from both trees (recursively collect all nodes, not just roots)
-        fn collect_nodes_recursive(
-            nodes: &[MessageNode],
-            collected: &mut HashMap<String, MessageNode>,
-        ) {
-            for node in nodes {
-                if let Some(uuid) = &node.entry.uuid {
-                    collected.insert(uuid.clone(), node.clone());
-                }
-                // Recursively collect children
-                collect_nodes_recursive(&node.children, collected);
-            }
-        }
-
-        collect_nodes_recursive(&local_roots, &mut merged_nodes);
-
-        // Merge remote nodes, combining children where nodes have same UUID
-        for remote_root in remote_roots {
-            self.merge_node_into(&remote_root, &mut merged_nodes);
-        }
-
-        // Detect branches (nodes with multiple children)
-        self.count_branches(&merged_nodes);
-
-        // Extract root nodes
-        let mut roots: Vec<MessageNode> = merged_nodes
-            .values()
-            .filter(|node| node.entry.parent_uuid.is_none())
-            .cloned()
-            .collect();
-
-        // Sort roots by timestamp
-        roots.sort_by(|a, b| {
-            let a_ts = a.entry.timestamp.as_ref();
-            let b_ts = b.entry.timestamp.as_ref();
-            a_ts.cmp(&b_ts)
-        });
-
-        Ok(roots)
-    }
-
-    /// Merges a node into the existing tree
-    #[allow(dead_code)]
-    #[allow(clippy::only_used_in_recursion)]
-    fn merge_node_into(
-        &mut self,
-        node: &MessageNode,
-        merged_nodes: &mut HashMap<String, MessageNode>,
-    ) {
-        if let Some(uuid) = &node.entry.uuid {
-            // Collect children that need to be merged recursively
-            let mut children_to_merge = Vec::new();
-
-            if let Some(existing) = merged_nodes.get_mut(uuid) {
-                // Node already exists, merge children
-                for child in &node.children {
-                    // Check if this child already exists
-                    let child_exists = if let Some(child_uuid) = &child.entry.uuid {
-                        existing
-                            .children
-                            .iter()
-                            .any(|c| c.entry.uuid.as_ref() == Some(child_uuid))
-                    } else {
-                        false
-                    };
-
-                    if !child_exists {
-                        // Add new child
-                        existing.add_child(child.clone());
-                    }
-
-                    // Collect child for recursive merge
-                    if child.entry.uuid.is_some() {
-                        children_to_merge.push(child.clone());
-                    }
-                }
-            } else {
-                // New node, add it
-                merged_nodes.insert(uuid.clone(), node.clone());
-
-                // Collect all children for recursive merge
-                for child in &node.children {
-                    children_to_merge.push(child.clone());
-                }
-            }
-
-            // Now recursively merge all collected children
-            for child in &children_to_merge {
-                self.merge_node_into(child, merged_nodes);
-            }
-        }
-    }
-
-    /// Counts the number of branches in the tree
-    #[allow(dead_code)]
-    fn count_branches(&mut self, nodes: &HashMap<String, MessageNode>) {
-        for node in nodes.values() {
-            if node.children.len() > 1 {
+        sort_uuids(&mut root_uuids);
+        for children in parent_to_children.values_mut() {
+            sort_uuids(children);
+            if children.len() > 1 {
                 self.stats.branches_detected += 1;
             }
         }
+        self.stats.orphan_roots_preserved = orphan_roots;
+
+        let mut ordered = Vec::with_capacity(uuid_to_entry.len());
+        let mut stack: Vec<String> = root_uuids.into_iter().rev().collect();
+        while let Some(uuid) = stack.pop() {
+            ordered.push(uuid_to_entry[&uuid].clone());
+            if let Some(children) = parent_to_children.get(&uuid) {
+                stack.extend(children.iter().rev().cloned());
+            }
+        }
+        Ok(ordered)
     }
 
     /// Merges non-UUID entries by timestamp, removing duplicates
