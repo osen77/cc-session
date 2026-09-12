@@ -240,6 +240,13 @@ Codex 和 OMP 历史会话分别从 `~/.codex/sessions/` 与 `~/.omp/agent/sessi
 每轮对话结束: Stop Hook → 后台节流推送
 ```
 
+如不需要发送消息时的新项目检测，可在 `config.toml` 中显式关闭；关闭后 `ccs hooks install` 不再安装该 hook，`ccs hooks check` 也不会把它缺失视为漂移：
+
+```toml
+[hooks]
+new_project_check = false
+```
+
 ## 配置同步
 
 除了对话历史，还支持跨设备同步 Claude Code 配置：

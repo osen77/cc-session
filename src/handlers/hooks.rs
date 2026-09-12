@@ -146,9 +146,9 @@ fn hook_command(subcommand: &str) -> String {
     format!("\"{}\" {}", exe, subcommand)
 }
 
-/// Get the hooks configuration to install.
-fn get_hooks_config() -> Value {
-    json!({
+/// Build the desired hooks configuration for the selected feature set.
+fn hooks_config_for(new_project_check: bool) -> Value {
+    let mut hooks = json!({
         "SessionStart": [
             {
                 "hooks": [
@@ -171,8 +171,11 @@ fn get_hooks_config() -> Value {
                     }
                 ]
             }
-        ],
-        "UserPromptSubmit": [
+        ]
+    });
+
+    if new_project_check {
+        hooks["UserPromptSubmit"] = json!([
             {
                 "hooks": [
                     {
@@ -182,8 +185,18 @@ fn get_hooks_config() -> Value {
                     }
                 ]
             }
-        ]
-    })
+        ]);
+    }
+
+    hooks
+}
+
+/// Get the hooks configuration to install.
+fn get_hooks_config() -> Value {
+    let new_project_check = crate::filter::FilterConfig::load()
+        .map(|config| config.hooks.new_project_check)
+        .unwrap_or(true);
+    hooks_config_for(new_project_check)
 }
 
 fn first_command_token(cmd: &str) -> Option<&str> {
@@ -569,11 +582,19 @@ pub fn handle_hooks_show() -> Result<()> {
             "SessionStart".cyan()
         );
         println!("  {} {} (Background push)", "•".green(), "Stop".cyan());
-        println!(
-            "  {} {} (New project detection)",
-            "•".green(),
-            "UserPromptSubmit".cyan()
-        );
+        if expected.get("UserPromptSubmit").is_some() {
+            println!(
+                "  {} {} (New project detection)",
+                "•".green(),
+                "UserPromptSubmit".cyan()
+            );
+        } else {
+            println!(
+                "  {} {} (New project detection): disabled via config",
+                "•".yellow(),
+                "UserPromptSubmit".cyan()
+            );
+        }
     } else {
         println!("{}", format!("{} hooks: NEED UPDATE", BINARY_NAME).yellow());
         println!();
@@ -1270,21 +1291,80 @@ mod tests {
         }
     }
 
-    fn expected() -> Value {
-        let mut expected = get_hooks_config();
+    fn expected_for(new_project_check: bool) -> Value {
+        let mut expected = hooks_config_for(new_project_check);
         for (event, subcommand) in [
             ("SessionStart", "hook-session-start"),
             ("Stop", "hook-stop"),
             ("UserPromptSubmit", "hook-new-project-check"),
         ] {
-            expected[event][0]["hooks"][0]["command"] =
-                json!(format!("\"/test/bin/ccs\" {subcommand}"));
+            if expected.get(event).is_some() {
+                expected[event][0]["hooks"][0]["command"] =
+                    json!(format!("\"/test/bin/ccs\" {subcommand}"));
+            }
         }
         expected
     }
 
+    fn expected() -> Value {
+        expected_for(true)
+    }
+
+    fn expected_settings_for(new_project_check: bool) -> Value {
+        json!({ "hooks": expected_for(new_project_check) })
+    }
+
     fn expected_settings() -> Value {
-        json!({ "hooks": expected() })
+        expected_settings_for(true)
+    }
+
+    fn settings_without_new_project_check() -> Value {
+        let mut settings = expected_settings();
+        settings["hooks"]
+            .as_object_mut()
+            .unwrap()
+            .remove("UserPromptSubmit");
+        settings
+    }
+
+    #[test]
+    fn hooks_config_includes_all_events_by_default() {
+        let config = hooks_config_for(true);
+        assert!(config.get("SessionStart").is_some());
+        assert!(config.get("Stop").is_some());
+        assert!(config.get("UserPromptSubmit").is_some());
+    }
+
+    #[test]
+    fn hooks_config_omits_new_project_check_when_disabled() {
+        let config = hooks_config_for(false);
+        assert!(config.get("SessionStart").is_some());
+        assert!(config.get("Stop").is_some());
+        assert!(config.get("UserPromptSubmit").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn get_hooks_config_reads_opt_out_from_isolated_config() {
+        let dir = tempdir().unwrap();
+        let _guard = EnvGuard::set(dir.path());
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[hooks]\nnew_project_check = false\n",
+        )
+        .unwrap();
+
+        assert!(get_hooks_config().get("UserPromptSubmit").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn get_hooks_config_fails_safe_on_malformed_config() {
+        let dir = tempdir().unwrap();
+        let _guard = EnvGuard::set(dir.path());
+        std::fs::write(dir.path().join("config.toml"), "[hooks\n").unwrap();
+
+        assert!(get_hooks_config().get("UserPromptSubmit").is_some());
     }
 
     #[test]
@@ -1333,6 +1413,49 @@ mod tests {
         assert!(drift
             .iter()
             .all(|item| matches!(item, HookDrift::Missing { .. })));
+    }
+
+    #[test]
+    fn opted_out_drift_ignores_missing_user_prompt_submit() {
+        let settings = settings_without_new_project_check();
+        assert!(detect_hook_drift(&settings, &expected_for(false)).is_empty());
+    }
+
+    #[test]
+    fn default_drift_reports_missing_user_prompt_submit() {
+        let settings = settings_without_new_project_check();
+        assert_eq!(
+            detect_hook_drift(&settings, &expected()),
+            vec![HookDrift::Missing {
+                event: "UserPromptSubmit".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn opted_out_drift_still_reports_remaining_field_mismatch() {
+        let mut settings = expected_settings_for(false);
+        settings["hooks"]["SessionStart"][0]["hooks"][0]["timeout"] = json!(30);
+        assert_eq!(
+            detect_hook_drift(&settings, &expected_for(false)),
+            vec![HookDrift::FieldMismatch {
+                event: "SessionStart".to_string(),
+                field: "timeout".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn opted_out_drift_still_reports_legacy_stop_wrapper() {
+        let mut settings = expected_settings_for(false);
+        settings["hooks"]["Stop"][0]["hooks"][0]["command"] =
+            json!("~/.claude/hooks/throttled-stop.sh");
+        assert_eq!(
+            detect_hook_drift(&settings, &expected_for(false)),
+            vec![HookDrift::LegacyWrapper {
+                event: "Stop".to_string(),
+            }]
+        );
     }
 
     #[test]

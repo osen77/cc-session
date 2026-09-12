@@ -255,6 +255,15 @@ ccs wrapper show       # 查看状态
 | `Stop` | 每轮对话完成后 | 节流 5 分钟、后台推送、连续失败 3 次后下一轮提示 |
 | `UserPromptSubmit` | 每次发送消息时 | 检测新项目并拉取远程历史 |
 
+`UserPromptSubmit` 默认启用。如不需要新项目检测，可在配置目录的 `config.toml` 中显式关闭：
+
+```toml
+[hooks]
+new_project_check = false
+```
+
+关闭后，`ccs hooks install` 不会安装该 hook，`ccs hooks check` 不会把它缺失视为漂移，`ccs hooks show` 会显示它已通过配置禁用。`ccs hooks uninstall` 仍会清理已有的 ccs hook。
+
 > **SessionStart 三重条件检测**：只有同时满足以下条件才会执行 pull：
 > 1. 进程观察结果明确为 1 个 Claude Code 主进程，native 和 npm-global 安装都支持
 > 2. `source = "startup"`，`resume`、`clear`、`compact`、`fork` 都跳过

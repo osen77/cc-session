@@ -115,6 +115,16 @@ impl Fixture {
         .expect("write config.toml");
     }
 
+    fn disable_new_project_check(&self) {
+        fs::write(
+            self.config.path().join("config.toml"),
+            "[config_sync]\nenabled = false\n\
+             [hooks]\nnew_project_check = false\n\
+             [session_maintenance]\nenabled = false\n",
+        )
+        .expect("write config.toml opt-out");
+    }
+
     fn settings_path(&self) -> PathBuf {
         self.home.path().join(".claude/settings.json")
     }
@@ -329,6 +339,53 @@ fn install_creates_three_hooks_and_preserves_other_events() {
         settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
         "audit.sh"
     );
+}
+
+#[test]
+#[serial]
+fn new_project_check_opt_out_installs_two_hooks_and_checks_cleanly() {
+    let fixture = Fixture::new();
+    fixture.disable_new_project_check();
+    fixture.write_settings(&json!({ "hooks": {} }));
+
+    assert_success(&fixture.run(&["hooks", "install"], b""), "hooks install");
+    let settings = fixture.read_settings();
+    assert_eq!(hook_commands(&settings, "SessionStart").len(), 1);
+    assert_eq!(hook_commands(&settings, "Stop").len(), 1);
+    assert!(hook_commands(&settings, "UserPromptSubmit").is_empty());
+
+    assert_success(
+        &fixture.run(&["hooks", "check", "--quiet"], b""),
+        "hooks check with new-project opt-out",
+    );
+    let shown = fixture.run(&["hooks", "show"], b"");
+    assert_success(&shown, "hooks show with new-project opt-out");
+    assert!(String::from_utf8_lossy(&shown.stdout)
+        .contains("UserPromptSubmit (New project detection): disabled via config"));
+}
+
+#[test]
+#[serial]
+fn uninstall_removes_existing_new_project_hook_while_opted_out() {
+    let fixture = Fixture::new();
+    fixture.disable_new_project_check();
+    fixture.write_settings(&json!({
+        "hooks": {
+            "UserPromptSubmit": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "\"/test/bin/ccs\" hook-new-project-check",
+                    "timeout": 30
+                }]
+            }]
+        }
+    }));
+
+    assert_success(
+        &fixture.run(&["hooks", "uninstall"], b""),
+        "hooks uninstall while opted out",
+    );
+    assert!(hook_commands(&fixture.read_settings(), "UserPromptSubmit").is_empty());
 }
 
 #[test]

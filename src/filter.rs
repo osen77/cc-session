@@ -61,6 +61,22 @@ impl Default for ConfigSyncSettings {
     }
 }
 
+/// Claude Code hook settings stored in FilterConfig.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HooksSettings {
+    /// Install and expect the UserPromptSubmit new-project detection hook.
+    #[serde(default = "default_true")]
+    pub new_project_check: bool,
+}
+
+impl Default for HooksSettings {
+    fn default() -> Self {
+        Self {
+            new_project_check: true,
+        }
+    }
+}
+
 impl ConfigSyncSettings {
     /// Get the device name (from config or friendly system name)
     pub fn get_device_name(&self) -> String {
@@ -301,6 +317,10 @@ pub struct FilterConfig {
     #[serde(default)]
     pub config_sync: ConfigSyncSettings,
 
+    /// Claude Code hook installation and drift-detection settings.
+    #[serde(default)]
+    pub hooks: HooksSettings,
+
     /// Auto memory sync settings (memory/ directory)
     #[serde(default)]
     pub auto_memory: AutoMemorySettings,
@@ -344,6 +364,7 @@ impl Default for FilterConfig {
             sync_subdirectory: default_sync_subdirectory(),
             use_project_name_only: true, // Default to multi-device mode
             config_sync: ConfigSyncSettings::default(),
+            hooks: HooksSettings::default(),
             auto_memory: AutoMemorySettings::default(),
             session_maintenance: SessionMaintenanceSettings::default(),
         }
@@ -879,6 +900,54 @@ mod tests {
         assert!(config.include_patterns.is_empty());
         assert!(config.exclude_patterns.is_empty());
         assert!(!config.exclude_attachments);
+    }
+
+    #[test]
+    fn legacy_toml_without_hooks_enables_new_project_check() {
+        let config: FilterConfig = toml::from_str("exclude_attachments = true\n").unwrap();
+        assert!(config.hooks.new_project_check);
+    }
+
+    #[test]
+    fn hooks_new_project_check_can_be_disabled() {
+        let config: FilterConfig = toml::from_str("[hooks]\nnew_project_check = false\n").unwrap();
+        assert!(!config.hooks.new_project_check);
+    }
+
+    #[test]
+    fn hooks_round_trip_preserves_config_sync_values() {
+        let source = r#"
+exclude_attachments = true
+
+[config_sync]
+enabled = false
+sync_settings = false
+sync_claude_md = false
+sync_hooks = true
+sync_skills_list = false
+auto_apply_claude_md = true
+push_with_config = false
+device_name = "test-device"
+
+[hooks]
+new_project_check = false
+"#;
+        let loaded: FilterConfig = toml::from_str(source).unwrap();
+        let serialized = toml::to_string_pretty(&loaded).unwrap();
+        let round_tripped: FilterConfig = toml::from_str(&serialized).unwrap();
+
+        assert!(!round_tripped.hooks.new_project_check);
+        assert!(!round_tripped.config_sync.enabled);
+        assert!(!round_tripped.config_sync.sync_settings);
+        assert!(!round_tripped.config_sync.sync_claude_md);
+        assert!(round_tripped.config_sync.sync_hooks);
+        assert!(!round_tripped.config_sync.sync_skills_list);
+        assert!(round_tripped.config_sync.auto_apply_claude_md);
+        assert!(!round_tripped.config_sync.push_with_config);
+        assert_eq!(
+            round_tripped.config_sync.device_name.as_deref(),
+            Some("test-device")
+        );
     }
 
     #[test]
