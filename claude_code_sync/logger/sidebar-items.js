@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["current_invocation_id","init_console_logger_with_options","init_logger","init_logger_with_options","log_to_file","rotate_log_if_needed"],"struct":["LoggerInitStatus","LoggerOptions"]};

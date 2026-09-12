@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Platform"],"fn":["cleanup_blank_lines","extract_current_platform_block","extract_platform_blocks","filter_for_platform","has_platform_blocks","merge_claude_md"],"static":["PLATFORM_BLOCK_REGEX"]};

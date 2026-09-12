@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["INTERACTIVE_WAIT"],"enum":["RepoLockOutcome"],"static":["REPO_LOCK_HELD"],"struct":["RepoLock"]};

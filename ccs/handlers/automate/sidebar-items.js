@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["handle_automate_setup","handle_automate_status","handle_automate_uninstall","print_success_message"]};

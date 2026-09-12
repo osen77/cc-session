@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["display_config_summary","handle_config_interactive","handle_config_wizard","handle_repo_selector","try_recover_existing_repo"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_SCAN_WARNINGS","SCAN_DIAGNOSTICS_SCHEMA_VERSION"],"enum":["ScanWarningCategory","ScanWarningErrorKind"],"fn":["error_kind_from_error","stable_path_hash"],"struct":["ChangedDuringRead","ScanDiagnostics","ScanWarning"]};

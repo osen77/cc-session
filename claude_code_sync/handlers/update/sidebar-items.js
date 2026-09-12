@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["check_for_update","check_for_update_silent","current_version","fetch_latest_version","handle_update","is_newer","print_update_notification"]};

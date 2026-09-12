@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["BINARY_NAME"],"enum":["VerbosityLevel"],"mod":["codex","config","conflict","filter","handlers","history","interactive_conflict","logger","merge","nav_select","omp","onboarding","parser","report","scm","session_cache","session_diagnostics","session_maintenance","session_model","sync","undo"]};

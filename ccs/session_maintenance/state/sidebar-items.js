@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["STATE_VERSION"],"enum":["LifecycleState","LifecycleTransition","PendingOperationKind"],"fn":["elapsed_at_least","identity_key","next_lifecycle","reconcile_fingerprint","validate_relative_path","validate_state","wait_for_maintenance_test_gate"],"struct":["LockedState","MaintenanceEntry","MaintenanceState","PendingOperation","StateStore"]};
