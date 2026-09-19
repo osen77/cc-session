@@ -170,9 +170,7 @@ fn clear_pending_suppression_after_outcome(
     }
 }
 
-use super::discovery::{
-    claude_projects_dir, discover_sessions, find_local_project_by_name, warn_large_files,
-};
+use super::discovery::{claude_projects_dir, discover_sessions, warn_large_files};
 use super::state::SyncState;
 use super::MAX_CONVERSATIONS_TO_DISPLAY;
 
@@ -340,9 +338,13 @@ fn sync_auto_memory_from_remote(
     remote_projects_dir: &Path,
     local_projects_root: &Path,
     use_project_name_only: bool,
+    mappings: &[crate::project_roots::ProjectRootMapping],
 ) -> Result<Vec<String>> {
     validate_sync_projects_root(sync_repo_path, remote_projects_dir)?;
-    validate_directory_root(local_projects_root)?;
+    if !mappings.iter().any(|mapping| mapping.project_dir == crate::project_roots::EXTERNAL_ROOT_PROJECT_DIR) {
+        validate_directory_root(local_projects_root)?;
+    }
+    let local_roots = crate::project_roots::enumerate(local_projects_root, mappings)?;
     let mut synced_projects = Vec::new();
 
     for entry in fs::read_dir(remote_projects_dir)? {
@@ -385,17 +387,16 @@ fn sync_auto_memory_from_remote(
         validate_directory_candidate(remote_projects_dir, &remote_memory_path)?;
 
         let local_project_dir = if use_project_name_only {
-            find_local_project_by_name(local_projects_root, &project_name)
+            super::discovery::find_mapped_local_project_by_name(
+                local_projects_root,
+                mappings,
+                &project_name,
+            )?
         } else {
-            let local_path = safe_join_within_root(local_projects_root, &project_relative)?;
-            match fs::symlink_metadata(&local_path) {
-                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                    Some(local_path)
-                }
-                Ok(_) => None,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error.into()),
-            }
+            local_roots
+                .iter()
+                .find(|root| root.project_dir == project_name)
+                .map(|root| root.logical_root.clone())
         };
 
         let Some(local_project_dir) = local_project_dir else {
@@ -405,7 +406,13 @@ fn sync_auto_memory_from_remote(
             );
             continue;
         };
-        validate_directory_candidate(local_projects_root, &local_project_dir)?;
+        let logical_memory_relative = local_project_dir
+            .strip_prefix(local_projects_root)
+            .context("memory project is outside Claude projects root")?
+            .join("memory");
+        let local_project_dir =
+            crate::project_roots::resolve(local_projects_root, mappings, &local_project_dir)?
+                .physical_root;
 
         let local_memory_path = safe_join_within_root(&local_project_dir, Path::new("memory"))?;
         match fs::symlink_metadata(&local_memory_path) {
@@ -418,7 +425,7 @@ fn sync_auto_memory_from_remote(
             }
             Err(error) => return Err(error.into()),
         }
-        validate_directory_candidate(local_projects_root, &local_memory_path)?;
+        validate_directory_candidate(&local_project_dir, &local_memory_path)?;
 
         for memory_entry in fs::read_dir(&remote_memory_path)? {
             let memory_entry = memory_entry?;
@@ -441,14 +448,40 @@ fn sync_auto_memory_from_remote(
             }
 
             validate_regular_candidate(remote_projects_dir, &source)?;
-            let destination =
-                safe_join_within_root(&local_memory_path, Path::new(&memory_entry.file_name()))?;
+            let relative = logical_memory_relative.join(memory_entry.file_name());
+            let (write_root, write_relative) =
+                crate::project_roots::file_boundary(local_projects_root, mappings, &relative)?;
+            let destination = safe_join_within_root(&write_root, &write_relative)?;
             fs::copy(&source, &destination)?;
         }
         synced_projects.push(project_name);
     }
 
     Ok(synced_projects)
+}
+
+#[test]
+fn creator_memory_does_not_match_skill_creator_suffix() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let projects = repo.join("projects");
+    let remote_memory = projects.join("creator/memory");
+    let local = temp.path().join("local");
+    let creator = local.join("-Volumes-Data-Projects-creator");
+    let skill = local.join("-plugins-skill-creator");
+    fs::create_dir_all(&remote_memory).unwrap();
+    fs::create_dir_all(&creator).unwrap();
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(creator.join("session.jsonl"), r#"{"type":"user","sessionId":"creator","cwd":"/Volumes/Data/Projects/creator","message":{"role":"user","content":"hello"}}"#).unwrap();
+    fs::write(skill.join("session.jsonl"), r#"{"type":"user","sessionId":"skill","cwd":"/plugins/skill-creator","message":{"role":"user","content":"hello"}}"#).unwrap();
+    fs::write(remote_memory.join("MEMORY.md"), b"isolated recovery marker").unwrap();
+    let synced = sync_auto_memory_from_remote(&repo, &projects, &local, true, &[]).unwrap();
+    assert_eq!(synced, vec!["creator"]);
+    assert_eq!(
+        fs::read(creator.join("memory/MEMORY.md")).unwrap(),
+        b"isolated recovery marker"
+    );
+    assert!(!skill.join("memory").exists());
 }
 
 /// Pull and merge history from sync repository
@@ -476,11 +509,20 @@ pub fn pull_history(
     else {
         return Ok(());
     };
+    if std::env::var_os("CCS_AUTOMATIC_HOOK").is_some()
+        && !crate::handlers::hooks::runtime_hooks_enabled()
+    {
+        return Ok(());
+    }
 
     let repo = scm::open(&state.sync_repo_path)?;
     let filter = FilterConfig::load()?;
+    let root_mappings = filter.root_mappings()?;
     let claude_dir = claude_projects_dir()?;
-    validate_directory_root(&claude_dir)?;
+    if filter.external_projects_root.is_none() {
+        validate_directory_root(&claude_dir)?;
+    }
+    crate::project_roots::enumerate(&claude_dir, &root_mappings)?;
 
     // Get the current branch name for operation record
     let branch_name = branch
@@ -528,7 +570,7 @@ pub fn pull_history(
 
     // Discover local sessions.
     println!("  {} local sessions...", "Discovering".cyan());
-    let local_sessions = discover_sessions(&claude_dir, &filter)?;
+    let local_sessions = super::discovery::discover_local_sessions(&claude_dir, &filter, false)?;
     println!(
         "  {} {} local sessions",
         "Found".green(),
@@ -879,9 +921,14 @@ pub fn pull_history(
                         .local_file
                         .strip_prefix(&claude_dir)
                         .context("conflict destination is outside Claude projects root")?;
-                    match append_merged_entries_guarded(
+                    let (write_root, write_relative) = crate::project_roots::file_boundary(
                         &claude_dir,
+                        &root_mappings,
                         local_relative,
+                    )?;
+                    match append_merged_entries_guarded(
+                        &write_root,
+                        &write_relative,
                         baseline,
                         &merged_session.entries,
                     ) {
@@ -1046,6 +1093,7 @@ pub fn pull_history(
                 &claude_dir,
                 &remote_projects_dir,
                 &conflict_baselines,
+                &root_mappings,
             ) {
                 Ok(applied) => applied,
                 Err(error) => {
@@ -1206,7 +1254,11 @@ pub fn pull_history(
                 .unwrap_or("unknown");
             validate_project_component(project_name)?;
 
-            let Some(local_project_dir) = find_local_project_by_name(&claude_dir, project_name)
+            let Some(local_project_dir) = super::discovery::find_mapped_local_project_by_name(
+                &claude_dir,
+                &root_mappings,
+                project_name,
+            )?
             else {
                 log::debug!(
                     "No matching local project found for '{}', skipping",
@@ -1229,7 +1281,7 @@ pub fn pull_history(
                 );
                 continue;
             };
-            validate_directory_candidate(&claude_dir, &local_project_dir)?;
+            crate::project_roots::resolve(&claude_dir, &root_mappings, &local_project_dir)?;
 
             let Some(filename) = remote_relative.file_name() else {
                 log::warn!(
@@ -1263,10 +1315,13 @@ pub fn pull_history(
                 .context("remote session is outside the sync projects root")?
                 .to_path_buf()
         };
+        let (write_root, write_relative) = crate::project_roots::file_boundary(
+            &claude_dir,
+            &root_mappings,
+            &relative_path_for_tracking,
+        )?;
 
-        if let Err(error) =
-            prepare_local_session_destination(&claude_dir, &relative_path_for_tracking)
-        {
+        if let Err(error) = prepare_local_session_destination(&write_root, &write_relative) {
             incomplete_reasons.insert(
                 remote_session.session_id.clone(),
                 format!("unsafe local destination: {error}"),
@@ -1299,10 +1354,15 @@ pub fn pull_history(
         // local filtering or parse errors may have hidden a physical file. Never
         // replace such a file through the Added path.
         if operation == SyncOperation::Added {
+            let (write_root, write_relative) = crate::project_roots::file_boundary(
+                &claude_dir,
+                &root_mappings,
+                &relative_path_for_tracking,
+            )?;
             match write_added_session_without_overwrite(
                 remote_session,
-                &claude_dir,
-                &relative_path_for_tracking,
+                &write_root,
+                &write_relative,
             ) {
                 Ok(AddedSessionWriteOutcome::Written(_)) => {
                     added_count += 1;
@@ -1381,11 +1441,16 @@ pub fn pull_history(
             let Some(discovery_local) = local_map.get(&remote_session.session_id) else {
                 unreachable!("Unchanged session must have a discovery baseline")
             };
+            let (write_root, write_relative) = crate::project_roots::file_boundary(
+                &claude_dir,
+                &root_mappings,
+                &relative_path_for_tracking,
+            )?;
             if !revalidate_unchanged_session(
                 discovery_local,
                 remote_session,
-                &claude_dir,
-                &relative_path_for_tracking,
+                &write_root,
+                &write_relative,
             )? {
                 skipped_changed_count += 1;
                 incomplete_reasons.insert(
@@ -1612,6 +1677,7 @@ pub fn pull_history(
             &remote_projects_dir,
             &claude_dir,
             filter.use_project_name_only,
+            &root_mappings,
         )?;
         if verbosity == VerbosityLevel::Verbose {
             for project_name in &synced_projects {
@@ -1651,6 +1717,151 @@ pub fn pull_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn mapped_projects_roundtrip_sessions_and_memory_in_both_layouts() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        struct Env(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Env {
+            fn drop(&mut self) {
+                for (key, value) in self.0.drain(..) {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _env = Env(["HOME", "USERPROFILE", "CLAUDE_CODE_SYNC_CONFIG_DIR"]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect());
+        for (name_only, mapped, nested) in [(false, false, true), (true, false, true), (false, true, true), (true, true, true), (false, true, false), (true, true, false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let base = temp.path().canonicalize().unwrap();
+            let home = base.join("home");
+            let config = base.join("config");
+            let local = home.join(".claude/projects");
+            let mount = base.join("volume");
+            let trusted = mount.join("projects");
+            let target = if mapped { trusted.join("encoded-project") } else { local.join("encoded-project") };
+            let repo_path = base.join("repo");
+            fs::create_dir_all(&local).unwrap();
+            fs::create_dir_all(&config).unwrap();
+            fs::create_dir_all(target.join("memory")).unwrap();
+            if mapped { symlink(&target, local.join("encoded-project")).unwrap(); }
+            fs::create_dir_all(&mount).unwrap();
+            for key in ["HOME", "USERPROFILE"] {
+                std::env::set_var(key, &home);
+            }
+            std::env::set_var("CLAUDE_CODE_SYNC_CONFIG_DIR", &config);
+            let original = b"{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"session\",\"cwd\":\"/work/project\",\"message\":{\"role\":\"user\",\"content\":\"original\"}}\n";
+            fs::write(target.join("session.jsonl"), original).unwrap();
+            if nested {
+            fs::create_dir_all(target.join("session/subagents")).unwrap();
+            fs::write(target.join("session/subagents/agent-child.jsonl"), b"{\"type\":\"user\",\"uuid\":\"child\",\"sessionId\":\"agent-child\",\"cwd\":\"/work/project\",\"message\":{\"role\":\"user\",\"content\":\"nested synthetic\"}}\n").unwrap();
+            }
+            fs::write(target.join("memory/MEMORY.md"), b"local memory").unwrap();
+            let inode = fs::metadata(target.join("session.jsonl")).unwrap().ino();
+            let repo = crate::scm::init(&repo_path).unwrap();
+            fs::write(repo_path.join("marker"), b"fixture").unwrap();
+            repo.stage_all().unwrap();
+            repo.commit("fixture").unwrap();
+            SyncState {
+                sync_repo_path: repo_path.clone(),
+                has_remote: false,
+                is_cloned_repo: false,
+                last_synced_commit: None,
+            }
+            .save()
+            .unwrap();
+            let mapping = crate::project_roots::ProjectRootMapping {
+                project_dir: "encoded-project".into(),
+                target: target.clone(),
+                trusted_root: trusted,
+                volume_uuid: "AF9C9871-18AE-40C9-8D18-624E415520C6".into(),
+            };
+            let mut filter = FilterConfig {
+                use_project_name_only: name_only,
+                project_roots: if mapped { vec![mapping.clone()] } else { vec![] },
+                ..FilterConfig::default()
+            };
+            filter.session_maintenance.enabled = false;
+            filter.config_sync.enabled = false;
+            filter.save().unwrap();
+            let volume = crate::project_roots::VolumeIdentity {
+                mount_point: mount.clone(),
+                volume_uuid: mapping.volume_uuid,
+                device_id: fs::metadata(mount).unwrap().dev(),
+            };
+            crate::project_roots::with_test_volume(volume, || {
+                crate::sync::push_history(
+                    None,
+                    false,
+                    None,
+                    false,
+                    false,
+                    false,
+                    false,
+                    true,
+                    crate::VerbosityLevel::Quiet,
+                )
+                .unwrap();
+                let remote = repo_path.join("projects").join(if name_only {
+                    "project"
+                } else {
+                    "encoded-project"
+                });
+                assert_eq!(
+                    fs::read(remote.join("memory/MEMORY.md")).unwrap(),
+                    b"local memory"
+                );
+                if nested {
+                let nested_destination = if name_only { remote.join("agent-child.jsonl") } else { remote.join("session/subagents/agent-child.jsonl") };
+                assert!(nested_destination.is_file());
+                let memories = walkdir::WalkDir::new(repo_path.join("projects")).into_iter().filter_map(Result::ok).filter(|entry| entry.file_name() == "MEMORY.md").count();
+                assert_eq!(memories, 1, "one project memory destination across main and nested sessions");
+                    return;
+                }
+                fs::write(remote.join("new.jsonl"), b"{\"type\":\"user\",\"sessionId\":\"new\",\"cwd\":\"/work/project\",\"message\":{\"role\":\"user\",\"content\":\"remote\"}}\n").unwrap();
+                fs::write(remote.join("memory/MEMORY.md"), b"remote memory").unwrap();
+                repo.stage_all().unwrap();
+                repo.commit("remote update").unwrap();
+                pull_history(false, None, false, crate::VerbosityLevel::Quiet).unwrap();
+                assert!(target.join("new.jsonl").is_file());
+                assert_eq!(
+                    fs::read(target.join("memory/MEMORY.md")).unwrap(),
+                    b"remote memory"
+                );
+                assert_eq!(fs::read(target.join("session.jsonl")).unwrap(), original);
+                assert_eq!(
+                    fs::metadata(target.join("session.jsonl")).unwrap().ino(),
+                    inode
+                );
+                if !mapped { return; }
+                let cache_path = config.join("session_index.json");
+                fs::write(&cache_path, b"cache sentinel").unwrap();
+                let before_head = repo.current_commit_hash().unwrap();
+                let before_memory = fs::read(remote.join("memory/MEMORY.md")).unwrap();
+                let child = target.join("-nested");
+                fs::create_dir(&child).unwrap();
+                symlink(&child, local.join("-nested")).unwrap();
+                filter.project_roots.push(crate::project_roots::ProjectRootMapping {
+                    project_dir: "-nested".into(), target: child,
+                    trusted_root: target.clone(), volume_uuid: filter.project_roots[0].volume_uuid.clone(),
+                });
+                filter.save().unwrap();
+                assert!(crate::sync::push_history(None, false, None, false, false, false, false, true, crate::VerbosityLevel::Quiet).is_err());
+                assert!(pull_history(false, None, false, crate::VerbosityLevel::Quiet).is_err());
+                assert_eq!(repo.current_commit_hash().unwrap(), before_head);
+                assert!(!repo.has_changes().unwrap());
+                assert_eq!(fs::read(remote.join("memory/MEMORY.md")).unwrap(), before_memory);
+                assert_eq!(fs::read(&cache_path).unwrap(), b"cache sentinel");
+            });
+        }
+    }
 
     #[test]
     fn suppression_decision_skips_same_revision_and_restores_changed_revision() {
@@ -2130,7 +2341,8 @@ mod tests {
         fs::write(remote_memory.join("note.md"), b"remote memory").unwrap();
 
         let synced =
-            sync_auto_memory_from_remote(&repo, &remote_projects, &local_projects, false).unwrap();
+            sync_auto_memory_from_remote(&repo, &remote_projects, &local_projects, false, &[])
+                .unwrap();
         assert_eq!(synced, vec!["project"]);
         assert_eq!(
             fs::read(local_project.join("memory/note.md")).unwrap(),
@@ -2205,7 +2417,7 @@ mod tests {
             }
 
             assert!(
-                sync_auto_memory_from_remote(&repo, &remote_projects, &local_projects, false)
+                sync_auto_memory_from_remote(&repo, &remote_projects, &local_projects, false, &[])
                     .is_err(),
                 "mode={mode}"
             );
@@ -2468,6 +2680,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             crate::VerbosityLevel::Quiet,
         )
         .unwrap();
@@ -2504,6 +2717,7 @@ mod tests {
             None,
             false,
             None,
+            false,
             false,
             false,
             false,

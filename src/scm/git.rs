@@ -476,7 +476,13 @@ mod tests {
     #[test]
     fn test_classify_rebase_continue_conflict_state_from_stdout() {
         let output = Output {
-            status: Command::new("true").status().unwrap(),
+            status: {
+                #[cfg(unix)]
+                use std::os::unix::process::ExitStatusExt;
+                #[cfg(windows)]
+                use std::os::windows::process::ExitStatusExt;
+                std::process::ExitStatus::from_raw(0)
+            },
             stdout: b"You must edit all merge conflicts and then\nrun git rebase --continue\n"
                 .to_vec(),
             stderr: Vec::new(),

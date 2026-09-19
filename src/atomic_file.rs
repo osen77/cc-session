@@ -125,7 +125,7 @@ fn validate_open_lock_path(lock_path: &Path) -> Result<()> {
 }
 
 pub(crate) fn persist_json_pretty_atomic<T: Serialize>(target: &Path, value: &T) -> Result<()> {
-    persist_json_bytes_atomic(target, serde_json::to_vec_pretty(value)?)
+    persist_bytes_atomic(target, &serde_json::to_vec_pretty(value)?)
 }
 
 pub(crate) fn persist_json_atomic<T: Serialize>(target: &Path, value: &T) -> Result<()> {
@@ -140,15 +140,15 @@ pub(crate) fn persist_json_atomic<T: Serialize>(target: &Path, value: &T) -> Res
             anyhow::bail!("test atomic persist failure");
         }
     }
-    persist_json_bytes_atomic(target, serde_json::to_vec(value)?)
+    persist_bytes_atomic(target, &serde_json::to_vec(value)?)
 }
 
-fn persist_json_bytes_atomic(target: &Path, bytes: Vec<u8>) -> Result<()> {
+pub(crate) fn persist_bytes_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
     let parent = target.parent().context("JSON target has no parent")?;
     std::fs::create_dir_all(parent)?;
     let mut temp = NamedTempFile::new_in(parent)?;
     set_private_file_permissions(temp.as_file())?;
-    temp.write_all(&bytes)?;
+    temp.write_all(bytes)?;
     temp.flush()?;
     temp.as_file().sync_all()?;
     temp.persist(target).map_err(|error| error.error)?;

@@ -20,6 +20,46 @@
 
 ---
 
+## 外盘项目映射与定时推送
+
+`ccs hooks disable` 停用自动 hook，`ccs hooks enable` 恢复，`ccs hooks status` 查看运行时状态。开关不删除用户其他 hook；残留后台 hook 子进程在同步入口重新检查开关。手动 `push` / `pull` 不受此开关限制。
+
+外盘支持两种互斥模式。旧配置按项目登记单个目录：
+
+```toml
+[[project_roots]]
+project_dir = "encoded-project"
+target = "/Volumes/Data/Claude/projects/encoded-project"
+trusted_root = "/Volumes/Data/Claude/projects"
+volume_uuid = "AF9C9871-18AE-40C9-8D18-624E415520C6"
+```
+
+统一外盘根使用本机专用配置；逻辑 `~/.claude/projects` 必须是指向目标的一跳绝对软链，目标下未来新增的一级项目会自动纳入：
+
+```toml
+[external_projects_root]
+target = "/Volumes/Data/Claude/projects"
+trusted_root = "/Volumes/Data/Claude"
+volume_uuid = "AF9C9871-18AE-40C9-8D18-624E415520C6"
+```
+
+`external_projects_root` 与 `[[project_roots]]` 不能同时配置，也不会进入设备配置同步。UUID 必须使用自己的实际卷 UUID；卷缺失、错误 UUID、改指、链式链接、嵌套挂载、项目或文件链接逃逸一律拒绝，不会创建内盘替身掩盖离线卷。统一根下所有项目（包括未来新增项目）都继承外盘来源和 mutation guard；会话维护及旧 journal、rename/delete、recycle/restore 和触及外盘原文件的 undo 保持保守拒绝。查询不完整时保留缓存，不把不可访问的数据当作删除。
+
+授权不扩大 `trusted_root`：从该目录的设备边界发现实际挂载点，仅对挂载点查询 `diskutil`，核对 APFS、卷 UUID、设备和路径组件；`Mounted` 字段缺失不单独视为未挂载。所有已验证目标按 canonical 路径统一拒绝重复或祖孙重叠，即使使用不同 `trusted_root` 也不例外。`undo push` 在 soft reset 失败时保留历史与旧快照；成功后只移除选中记录，不删除后来追加的其他操作。
+
+```bash
+ccs schedule set --daily 05:00
+ccs schedule show
+ccs schedule enable
+ccs schedule disable
+# 也可选择固定间隔，与 --daily 互斥
+ccs schedule set --every-hours 6
+```
+
+首次设置只保存规则，启用须显式执行 `enable`；已启用时修改规则会更新现有任务。系统调度当前只支持 macOS，采用本机时间，不唤醒电脑、不逐次补跑错过的间隔。任务执行 `ccs push --scheduled`，不自动 pull、不交互、不 prune、不因删除解锁而删除远端缺失会话或 memory，也不自动同步配置。仓库锁忙则跳过，结果可用 `schedule show` 查看。
+
+定时运行在修改同步仓库前读取完整候选及 memory；JSONL 仅接受稳定的完整行前缀，破损完整行会失败，未完成尾行不上传。CCS 仍受日期、大小与内容过滤限制，不覆盖全部附件、工具输出或原始文件元数据，不能替代保真的全量备份。
+
 ## 安装与更新
 
 ### 一键安装（推荐）

@@ -321,6 +321,30 @@ impl LockedState<'_> {
 }
 
 impl StateStore {
+    pub(crate) fn reject_mapped_mutation(
+        &self,
+        source: SessionSource,
+        relative: &Path,
+    ) -> Result<()> {
+        if source != SessionSource::Claude {
+            return Ok(());
+        }
+        let path = self.state_path.with_file_name("config.toml");
+        let config = match std::fs::read_to_string(path) {
+            Ok(text) => toml::from_str::<crate::filter::FilterConfig>(&text)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if config.external_projects_root.is_some()
+            || config
+                .project_roots
+                .iter()
+                .any(|mapping| relative.starts_with(&mapping.project_dir))
+        {
+            anyhow::bail!("maintenance mutation is not supported for externally stored Claude projects");
+        }
+        Ok(())
+    }
     pub(crate) fn from_config_dir(config_dir: &Path) -> Self {
         Self {
             state_path: config_dir.join("session-maintenance.json"),

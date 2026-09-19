@@ -527,6 +527,7 @@ fn test_protected_suppressed_missing_session_survives_push_policies_without_tomb
             false,
             false,
             false,
+            false,
             claude_code_sync::VerbosityLevel::Quiet,
         )
         .unwrap();
@@ -582,6 +583,7 @@ fn test_malformed_maintenance_state_blocks_unlock_but_manual_prune_remains_expli
         false,
         false,
         false,
+        false,
         claude_code_sync::VerbosityLevel::Quiet,
     )
     .expect("Protect must remain safe when maintenance state is malformed");
@@ -592,6 +594,7 @@ fn test_malformed_maintenance_state_blocks_unlock_but_manual_prune_remains_expli
         None,
         false,
         None,
+        false,
         false,
         false,
         false,
@@ -611,6 +614,7 @@ fn test_malformed_maintenance_state_blocks_unlock_but_manual_prune_remains_expli
         false,
         false,
         true,
+        false,
         claude_code_sync::VerbosityLevel::Quiet,
     )
     .expect("explicit manual prune remains the user's deletion authority");
@@ -654,6 +658,7 @@ fn test_missing_maintenance_state_allows_unlock_prune_as_ordinary_missing() {
         None,
         false,
         None,
+        false,
         false,
         false,
         false,
@@ -1237,4 +1242,67 @@ fn test_operation_record_with_no_commit_hash() {
     // Should be able to set it to Some
     record.commit_hash = Some("abc123".to_string());
     assert_eq!(record.commit_hash, Some("abc123".to_string()));
+}
+
+#[test]
+#[serial]
+fn scheduled_push_preserves_remote_sessions_and_memory_during_unlock() {
+    let home = TempDir::new().unwrap();
+    let config = TempDir::new().unwrap();
+    let repo_dir = TempDir::new().unwrap();
+    let _home_guard = HomeEnvGuard(std::env::var_os("HOME"));
+    std::env::set_var("HOME", home.path());
+    let _config_guard = ConfigEnvGuard::set(config.path());
+    let local = home.path().join(".claude/projects/project");
+    let remote = repo_dir.path().join("projects/project");
+    fs::create_dir_all(local.join("memory")).unwrap();
+    fs::create_dir_all(remote.join("memory")).unwrap();
+    fs::write(
+        config.path().join("config.toml"),
+        "[session_maintenance]\nenabled=false\n",
+    )
+    .unwrap();
+    let jsonl = b"{\"type\":\"user\",\"sessionId\":\"local\",\"cwd\":\"/workspace/project\",\"message\":{\"role\":\"user\",\"content\":\"local\"}}\n";
+    fs::write(local.join("local.jsonl"), jsonl).unwrap();
+    let missing = b"{\"type\":\"user\",\"sessionId\":\"missing\",\"cwd\":\"/workspace/project\"}\n";
+    fs::write(remote.join("missing.jsonl"), missing).unwrap();
+    fs::write(remote.join("memory/keep.md"), b"remote memory").unwrap();
+    let repo = scm::init(repo_dir.path()).unwrap();
+    repo.stage_all().unwrap();
+    repo.commit("remote fixture").unwrap();
+    create_test_sync_state(repo_dir.path(), config.path()).unwrap();
+    claude_code_sync::sync::delete_unlock::unlock(15).unwrap();
+    claude_code_sync::sync::push_history(
+        None,
+        false,
+        None,
+        false,
+        true,
+        false,
+        false,
+        true,
+        claude_code_sync::VerbosityLevel::Quiet,
+    )
+    .unwrap();
+    assert_eq!(fs::read(remote.join("missing.jsonl")).unwrap(), missing);
+    assert_eq!(
+        fs::read(remote.join("memory/keep.md")).unwrap(),
+        b"remote memory"
+    );
+    let before = repo.current_commit_hash().unwrap();
+    fs::write(local.join("local.jsonl"), b"{\"type\":").unwrap();
+    assert!(claude_code_sync::sync::push_history(
+        None,
+        false,
+        None,
+        false,
+        true,
+        false,
+        false,
+        true,
+        claude_code_sync::VerbosityLevel::Quiet
+    )
+    .is_err());
+    assert_eq!(repo.current_commit_hash().unwrap(), before);
+    assert_eq!(fs::read(remote.join("missing.jsonl")).unwrap(), missing);
 }

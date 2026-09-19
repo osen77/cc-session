@@ -11,6 +11,7 @@ pub mod history;
 pub mod hooks;
 pub mod onboarding;
 pub mod platform_filter;
+pub mod schedule;
 pub mod session;
 pub mod setup;
 pub mod undo;

@@ -61,6 +61,7 @@ pub(crate) fn recycle_session(
     requested: &MaintenanceEntry,
     now: DateTime<Utc>,
 ) -> Result<()> {
+    store.reject_mapped_mutation(requested.identity.source, &requested.original_relative_path)?;
     store.transaction(|locked| {
         if locked.state.pending.is_some() {
             anyhow::bail!("cannot recycle while another maintenance operation is pending")
@@ -175,6 +176,7 @@ pub(crate) fn restore_session(
     requested: &MaintenanceEntry,
     _now: DateTime<Utc>,
 ) -> Result<()> {
+    store.reject_mapped_mutation(requested.identity.source, &requested.original_relative_path)?;
     store.transaction(|locked| {
         if locked.state.pending.is_some() {
             anyhow::bail!("cannot restore while another maintenance operation is pending")
@@ -280,6 +282,7 @@ pub(crate) fn purge_session(
     requested: &MaintenanceEntry,
     now: DateTime<Utc>,
 ) -> Result<()> {
+    store.reject_mapped_mutation(requested.identity.source, &requested.original_relative_path)?;
     store.transaction(|locked| {
         if locked.state.pending.is_some() {
             anyhow::bail!("cannot purge while another maintenance operation is pending")
@@ -363,6 +366,7 @@ pub(crate) fn reconcile_pending(
         let Some(pending) = locked.state.pending.clone() else {
             return Ok(());
         };
+        store.reject_mapped_mutation(pending.identity.source, &pending.source_relative_path)?;
         let key = identity_key(&pending.identity);
         let entry = locked
             .state
@@ -1111,6 +1115,41 @@ mod tests {
     use crate::session_model::SessionIdentity;
     use std::fs;
     use tempfile::{tempdir, TempDir};
+
+    #[test]
+    fn mapped_project_rejects_old_journal_and_explicit_file_mutations() {
+        let fixture = RecycleFixture::new(SessionSource::Claude);
+        fixture.set_pending_recycle();
+        let config_path = fixture._dir.path().join("config.toml");
+        let mut config = crate::filter::FilterConfig::default();
+        config
+            .project_roots
+            .push(crate::project_roots::ProjectRootMapping {
+                project_dir: "project".into(),
+                target: fixture._dir.path().join("external/project"),
+                trusted_root: fixture._dir.path().join("external"),
+                volume_uuid: "AF9C9871-18AE-40C9-8D18-624E415520C6".into(),
+            });
+        fs::write(config_path, toml::to_string(&config).unwrap()).unwrap();
+        let state_path = fixture._dir.path().join("session-maintenance.json");
+        let before = fs::read(&state_path).unwrap();
+        assert!(reconcile_pending(&fixture.store, &fixture.roots, fixture.now).is_err());
+        assert!(
+            recycle_session(&fixture.store, &fixture.roots, &fixture.entry, fixture.now).is_err()
+        );
+        assert!(
+            restore_session(&fixture.store, &fixture.roots, &fixture.entry, fixture.now).is_err()
+        );
+        assert!(
+            purge_session(&fixture.store, &fixture.roots, &fixture.entry, fixture.now).is_err()
+        );
+        assert_eq!(fs::read(state_path).unwrap(), before);
+        assert_eq!(
+            fs::read(&fixture.source_file).unwrap(),
+            b"session contents\n"
+        );
+        assert!(!fixture.recycle_file().exists());
+    }
 
     struct RecycleFixture {
         _dir: TempDir,

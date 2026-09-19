@@ -361,35 +361,133 @@ fn prune_missing_repo_sessions(
     Ok(deleted)
 }
 
+struct MemorySnapshot {
+    root: crate::project_roots::ResolvedProjectRoot,
+    sync_project: PathBuf,
+    files: Vec<(std::ffi::OsString, Vec<u8>)>,
+}
+
+fn read_memory_snapshot(path: &Path) -> Result<Vec<u8>> {
+    let snapshot_started = std::time::Instant::now();
+    use std::io::{Read, Seek, SeekFrom};
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    let before = file.metadata()?;
+    anyhow::ensure!(before.is_file(), "memory source is not a regular file");
+    let size = usize::try_from(before.len()).context("memory snapshot too large")?;
+    let mut bytes = vec![0; size];
+    file.read_exact(&mut bytes)?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut remaining = size;
+    let mut buffer = [0u8; 65536];
+    while remaining > 0 {
+        let count = remaining.min(buffer.len());
+        file.read_exact(&mut buffer[..count])?;
+        hasher.update(&buffer[..count]);
+        remaining -= count;
+    }
+    anyhow::ensure!(
+        hasher.finalize() == blake3::hash(&bytes),
+        "memory changed during snapshot"
+    );
+    let after = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        after.is_file() && !after.file_type().is_symlink() && after.len() == before.len(),
+        "memory snapshot path or length changed"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(
+            before.dev() == after.dev() && before.ino() == after.ino(),
+            "memory snapshot identity changed"
+        );
+    }
+    super::push_diagnostics::snapshot(bytes.len() as u64, snapshot_started.elapsed());
+    Ok(bytes)
+}
+
+fn prepare_memory_snapshots(
+    roots: &crate::project_roots::ProjectRootIndex<'_>,
+    project_dir_to_sync: &HashMap<PathBuf, PathBuf>,
+) -> Result<Vec<MemorySnapshot>> {
+    let mut snapshots = Vec::new();
+    for (local_dir, sync_project) in project_dir_to_sync {
+        let root = roots.resolve(local_dir)?;
+        let local_memory = root.physical_root.join("memory");
+        let metadata = match fs::symlink_metadata(&local_memory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "local auto-memory path must not be a symlink"
+        );
+        if !metadata.is_dir() {
+            continue;
+        }
+        validate_directory_candidate(&root.physical_root, &local_memory)?;
+        let mut files = Vec::new();
+        for entry in fs::read_dir(&local_memory)? {
+            let entry = entry?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                continue;
+            }
+            validate_regular_candidate(&root.physical_root, &entry.path())?;
+            let bytes = read_memory_snapshot(&entry.path())?;
+            validate_regular_candidate(&root.physical_root, &entry.path())?;
+            files.push((entry.file_name(), bytes));
+        }
+        anyhow::ensure!(
+            roots.resolve(local_dir)? == root,
+            "memory project mapping changed during snapshot"
+        );
+        snapshots.push(MemorySnapshot {
+            root,
+            sync_project: sync_project.clone(),
+            files,
+        });
+    }
+    Ok(snapshots)
+}
+
 fn sync_auto_memory_directories(
     sync_repo_path: &Path,
     projects_dir: &Path,
-    local_projects_root: &Path,
+    roots: &crate::project_roots::ProjectRootIndex<'_>,
     project_dir_to_sync: &HashMap<PathBuf, PathBuf>,
+    preserve_missing: bool,
+    prepared: Option<&[MemorySnapshot]>,
 ) -> Result<(usize, usize)> {
     validate_sync_projects_root(sync_repo_path, projects_dir)?;
-    validate_directory_root(local_projects_root)?;
+    let owned;
+    let snapshots = match prepared {
+        Some(snapshots) => snapshots,
+        None => {
+            owned = prepare_memory_snapshots(roots, project_dir_to_sync)?;
+            &owned
+        }
+    };
 
     let mut synced_count = 0;
     let mut local_memory_by_sync: HashMap<PathBuf, std::collections::HashSet<std::ffi::OsString>> =
         HashMap::new();
 
-    for (local_dir, sync_project) in project_dir_to_sync {
-        validate_directory_candidate(local_projects_root, local_dir)?;
-        let local_memory = local_dir.join("memory");
-        let local_memory_metadata = match fs::symlink_metadata(&local_memory) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
-        };
-        if local_memory_metadata.file_type().is_symlink() {
-            anyhow::bail!("local auto-memory path must not be a symlink");
-        }
-        if !local_memory_metadata.is_dir() {
-            continue;
-        }
-        validate_directory_candidate(local_projects_root, &local_memory)?;
-
+    for snapshot in snapshots {
+        let sync_project = &snapshot.sync_project;
+        anyhow::ensure!(
+            roots.resolve(&snapshot.root.logical_root)? == snapshot.root,
+            "memory project mapping changed before write"
+        );
         let memory_relative = sync_project.join("memory");
         let dest_memory_dir =
             safe_join_within_sync_projects_root(sync_repo_path, projects_dir, &memory_relative)?;
@@ -410,15 +508,7 @@ fn sync_auto_memory_directories(
         let file_set = local_memory_by_sync
             .entry(sync_project.clone())
             .or_default();
-        for entry in fs::read_dir(&local_memory)? {
-            let entry = entry?;
-            let source_path = entry.path();
-            let source_metadata = fs::symlink_metadata(&source_path)?;
-            if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
-                continue;
-            }
-
-            let file_name = entry.file_name();
+        for (file_name, bytes) in &snapshot.files {
             file_set.insert(file_name.clone());
             let relative = memory_relative.join(&file_name);
             let destination =
@@ -443,10 +533,17 @@ fn sync_auto_memory_directories(
                     );
                 }
             }
-            fs::copy(&source_path, &destination)?;
+            anyhow::ensure!(
+                roots.resolve(&snapshot.root.logical_root)? == snapshot.root,
+                "memory project mapping changed before write"
+            );
+            fs::write(&destination, bytes)?;
         }
 
         synced_count += 1;
+    }
+    if preserve_missing {
+        return Ok((synced_count, 0));
     }
 
     let mut deleted_memory_count = 0;
@@ -483,13 +580,14 @@ fn sync_auto_memory_directories(
 
             let relative = memory_relative.join(&file_name);
             let canonical_root = validate_sync_projects_root(sync_repo_path, projects_dir)?;
-            let candidate =
-                safe_join_within_sync_projects_root(sync_repo_path, projects_dir, &relative)?;
+            let candidate = safe_join_within_root(&canonical_root, &relative)?;
             validate_regular_candidate(&canonical_root, &candidate)?;
             // Final fail-safe revalidation immediately before unlink.
             let canonical_root = validate_sync_projects_root(sync_repo_path, projects_dir)?;
-            let candidate =
-                safe_join_within_sync_projects_root(sync_repo_path, projects_dir, &relative)?;
+            let candidate = safe_join_within_root(&canonical_root, &relative)?;
+            for snapshot in snapshots.iter().filter(|snapshot| &snapshot.sync_project == sync_project) {
+                roots.resolve(&snapshot.root.logical_root)?;
+            }
             validate_regular_candidate(&canonical_root, &candidate)?;
             fs::remove_file(candidate)?;
             deleted_memory_count += 1;
@@ -517,9 +615,18 @@ pub fn push_history(
     sync_config: bool,
     interactive: bool,
     prune: bool,
+    scheduled: bool,
     verbosity: crate::VerbosityLevel,
 ) -> Result<()> {
     use crate::VerbosityLevel;
+    let _diagnostics = super::push_diagnostics::Operation::start(scheduled || std::env::var_os("CCS_PUSH_PERF").is_some());
+    let _push_stage = super::push_diagnostics::Stage::start("push");
+    let lock_stage = super::push_diagnostics::Stage::start("state_lock");
+    anyhow::ensure!(
+        !scheduled || (!prune && !interactive),
+        "scheduled push cannot prune or prompt"
+    );
+    let sync_config = sync_config && !scheduled;
 
     if verbosity != VerbosityLevel::Quiet {
         println!("{}", "Pushing Claude Code history...".cyan().bold());
@@ -536,787 +643,862 @@ pub fn push_history(
         verbosity,
     )?
     else {
+        if scheduled {
+            crate::handlers::schedule::record_result(
+                crate::handlers::schedule::ScheduledOutcome::LockBusy,
+                None,
+            )?;
+        }
         return Ok(());
     };
-
-    let repo = scm::open(&state.sync_repo_path)?;
-    let mut filter = FilterConfig::load()?;
-
-    // Override exclude_attachments if specified in command
-    if exclude_attachments {
-        filter.exclude_attachments = true;
-    }
-
-    // Set up LFS if enabled
-    if filter.enable_lfs {
-        if verbosity != VerbosityLevel::Quiet {
-            println!("  {} Git LFS...", "Configuring".cyan());
-        }
-        scm::lfs::setup(&state.sync_repo_path, &filter.lfs_patterns)
-            .context("Failed to set up Git LFS")?;
-    }
-
-    let claude_dir = claude_projects_dir()?;
-    validate_directory_root(&claude_dir)?;
-
-    // Check directory structure consistency before pushing. The projects root
-    // is an untrusted checkout boundary: it must be a real directory inside
-    // the sync repository, never a symlink to an external tree.
-    let projects_dir = state.sync_repo_path.join(&filter.sync_subdirectory);
-    if !projects_dir.exists() {
-        fs::create_dir_all(&projects_dir)?;
-    }
-    let projects_dir = validate_sync_projects_root(&state.sync_repo_path, &projects_dir)?;
+    if std::env::var_os("CCS_AUTOMATIC_HOOK").is_some()
+        && !crate::handlers::hooks::runtime_hooks_enabled()
     {
-        let structure_check =
-            check_directory_structure_consistency(&projects_dir, filter.use_project_name_only);
+        return Ok(());
+    }
+    if scheduled {
+        crate::handlers::schedule::record_result(
+            crate::handlers::schedule::ScheduledOutcome::Running,
+            None,
+        )?;
+    }
+    let mut scheduled_changed = false;
+    drop(lock_stage);
+    let result = (|| -> Result<()> {
+        let repo = scm::open(&state.sync_repo_path)?;
+        let mut filter = FilterConfig::load()?;
+        let root_mappings = filter.root_mappings()?;
 
-        if !structure_check.is_consistent {
-            if let Some(warning) = &structure_check.warning {
-                if verbosity != VerbosityLevel::Quiet {
-                    println!();
-                    println!("{}", "⚠️  目录结构不一致警告".yellow().bold());
-                    println!("{}", "─".repeat(50).dimmed());
-                    println!("{}", warning.yellow());
-                    println!();
-                }
-
-                if interactive && interactive_conflict::is_interactive() {
-                    let proceed = Confirm::new("是否继续推送？")
-                        .with_default(false)
-                        .with_help_message("建议先清理目录结构再继续")
-                        .prompt()
-                        .context("取消确认")?;
-
-                    if !proceed {
-                        println!("\n{}", "推送已取消。".yellow());
-                        println!(
-                            "提示：使用 '{}' 可以切换同步模式",
-                            format!(
-                                "{} config --use-project-name-only <true|false>",
-                                BINARY_NAME
-                            )
-                            .cyan()
-                        );
-                        return Ok(());
-                    }
-                } else if verbosity != VerbosityLevel::Quiet {
-                    println!(
-                        "{}",
-                        "使用 --interactive 选项可以在不一致时选择是否继续".dimmed()
-                    );
-                }
-            }
+        let claude_dir = claude_projects_dir()?;
+        let roots_stage = super::push_diagnostics::Stage::start("root_validation");
+        let roots = crate::project_roots::ProjectRootIndex::new(&claude_dir, &root_mappings)?;
+        drop(roots_stage);
+        // Override exclude_attachments if specified in command
+        if exclude_attachments {
+            filter.exclude_attachments = true;
         }
-    }
+        // Read all local sessions before any repository mutation, including LFS setup.
+        let discovery_stage = super::push_diagnostics::Stage::start("discovery_snapshot");
+        let sessions = super::discovery::discover_local_sessions_in_roots(roots.roots(), &filter, scheduled)?;
+        drop(discovery_stage);
+        let routing_stage = super::push_diagnostics::Stage::start("session_routing");
+        // Mapping from local project dir -> sync repo project dir (for memory sync)
+        let mut project_dir_to_sync: HashMap<PathBuf, PathBuf> = HashMap::new();
 
-    // Get the current branch name for operation record
-    let branch_name = branch
-        .map(|s| s.to_string())
-        .or_else(|| repo.current_branch().ok())
-        .unwrap_or_else(|| "main".to_string());
-
-    // Discover all sessions
-    if verbosity != VerbosityLevel::Quiet {
-        println!("  {} conversation sessions...", "Discovering".cyan());
-    }
-    let sessions = discover_sessions(&claude_dir, &filter)?;
-    if verbosity != VerbosityLevel::Quiet {
-        println!("  {} {} sessions", "Found".green(), sessions.len());
-    }
-
-    // Check for project name collisions when using project-name-only mode
-    if filter.use_project_name_only {
-        let collisions = find_colliding_projects(&claude_dir);
-        if !collisions.is_empty() && verbosity != VerbosityLevel::Quiet {
-            println!();
-            println!(
-                "{}",
-                "Warning: Multiple projects map to the same name:"
-                    .yellow()
-                    .bold()
-            );
-            for (name, paths) in &collisions {
-                println!("  {} -> {} locations:", name.cyan(), paths.len());
-                for path in paths.iter().take(3) {
-                    let display_path = path
+        // Closure to compute the relative path for a session, respecting use_project_name_only
+        let compute_relative_path =
+            |session: &crate::parser::ConversationSession| -> Result<Option<PathBuf>> {
+                if filter.use_project_name_only {
+                    let filename = Path::new(&session.file_path)
                         .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown");
-                    println!("    - {}", display_path);
+                        .ok_or_else(|| anyhow::anyhow!("session file has no filename"))?;
+                    let Some(project_name) = session.project_name() else {
+                        return Ok(None);
+                    };
+                    Ok(Some(safe_project_relative_path(project_name, filename)?))
+                } else {
+                    let logical = Path::new(&session.file_path).strip_prefix(&claude_dir)?;
+                    anyhow::ensure!(logical.components().all(|component| matches!(component, std::path::Component::Normal(_))), "invalid logical session path");
+                    Ok(Some(logical.to_path_buf()))
                 }
-                if paths.len() > 3 {
-                    println!("    ... and {} more", paths.len() - 3);
-                }
-            }
-            println!();
-            println!(
-                "{}",
-                "Sessions from colliding projects will be merged into the same directory.".yellow()
-            );
-            println!();
-        }
-    }
-
-    // ============================================================================
-    // COPY SESSIONS AND TRACK CHANGES
-    // ============================================================================
-    // Note: projects_dir was validated above as the trusted sync root.
-
-    // Discover existing sessions in sync repo to determine operation type
-    if verbosity != VerbosityLevel::Quiet {
-        println!("  {} sessions to sync repository...", "Copying".cyan());
-    }
-    let existing_sessions = discover_sessions(&projects_dir, &filter)?;
-    let existing_map: HashMap<_, _> = existing_sessions
-        .iter()
-        .map(|s| (s.session_id.clone(), s))
-        .collect();
-    // A previous incomplete pull protects the guarded session/path across all
-    // later remote revisions until a pull completes the current revision.
-    // Corrupt guard state fails closed.
-    let pull_guard = PullGuardRegistry::load()?;
-
-    // content_hash re-serializes every entry; computed serially inside the copy
-    // loop it dominated push time, so precompute both sides in parallel.
-    use rayon::prelude::*;
-    let local_hashes: HashMap<String, String> = sessions
-        .par_iter()
-        .map(|s| (s.session_id.clone(), s.content_hash()))
-        .collect();
-    let existing_hashes: HashMap<String, String> = existing_sessions
-        .par_iter()
-        .map(|s| (s.session_id.clone(), s.content_hash()))
-        .collect();
-
-    // Track pushed conversations for operation record
-    let mut pushed_conversations: Vec<ConversationSummary> = Vec::new();
-    let mut added_count = 0;
-    let mut modified_count = 0;
-    let mut unchanged_count = 0;
-
-    // Track sessions skipped due to missing cwd
-    let mut skipped_no_cwd = 0;
-    let mut skipped_pull_guard = 0;
-
-    // Mapping from local project dir -> sync repo project dir (for memory sync)
-    let mut project_dir_to_sync: HashMap<PathBuf, PathBuf> = HashMap::new();
-
-    // Closure to compute the relative path for a session, respecting use_project_name_only
-    let compute_relative_path =
-        |session: &crate::parser::ConversationSession| -> Result<Option<PathBuf>> {
-            if filter.use_project_name_only {
-                let filename = Path::new(&session.file_path)
-                    .file_name()
-                    .ok_or_else(|| anyhow::anyhow!("session file has no filename"))?;
-                let Some(project_name) = session.project_name() else {
-                    return Ok(None);
+            };
+        for session in &sessions {
+            if let Some(relative) = compute_relative_path(session)? {
+                let root = roots.session_project_root(Path::new(&session.file_path))?;
+                let Some(std::path::Component::Normal(sync_project)) = relative.components().next() else {
+                    anyhow::bail!("invalid sync project component");
                 };
-                Ok(Some(safe_project_relative_path(project_name, filename)?))
-            } else {
-                Ok(Some(safe_relative_path_within_root(
-                    &claude_dir,
-                    Path::new(&session.file_path),
-                )?))
-            }
-        };
-
-    for session in &sessions {
-        let relative_path = match compute_relative_path(session)? {
-            Some(path) => path,
-            None => {
-                skipped_no_cwd += 1;
-                log::debug!("Skipping session {} (no cwd)", session.session_id);
-                continue;
-            }
-        };
-
-        // Build project dir mapping for memory sync (amortized during session loop)
-        if let Some(sync_project_dir) = relative_path.parent() {
-            if !sync_project_dir.as_os_str().is_empty() {
-                let local_project_dir = Path::new(&session.file_path)
-                    .parent()
-                    .unwrap_or(Path::new(""));
-                project_dir_to_sync
-                    .entry(local_project_dir.to_path_buf())
-                    .or_insert_with(|| sync_project_dir.to_path_buf());
+                crate::path_security::validate_project_component(sync_project.to_str().context("sync project is not UTF-8")?)?;
+                project_dir_to_sync.entry(root.logical_root).or_insert_with(|| PathBuf::from(sync_project));
             }
         }
-
-        let dest_path = safe_join_within_root(&projects_dir, &relative_path)?;
-
-        let existing = existing_map.get(&session.session_id);
-        if let Some(existing_remote) = existing {
-            if pull_guard.suppresses_push(
-                &session.session_id,
-                &relative_path,
-                Path::new(&existing_remote.file_path),
-            )? {
-                skipped_pull_guard += 1;
-                log::warn!(
-                    "Skipping push for unresolved pull session {} at {}",
-                    session.session_id,
-                    relative_path.display()
-                );
-                continue;
-            }
-        }
-
-        // Determine operation type based on existing state
-        let operation = if existing.is_some() {
-            if existing_hashes.get(&session.session_id) == local_hashes.get(&session.session_id) {
-                unchanged_count += 1;
-                SyncOperation::Unchanged
-            } else {
-                modified_count += 1;
-                SyncOperation::Modified
-            }
+        drop(routing_stage);
+        let memory_stage = super::push_diagnostics::Stage::start("memory_snapshot");
+        // Scheduled runs must read every memory byte before LFS, mkdir, or session writes.
+        let memory_snapshots = if scheduled && filter.auto_memory.enabled {
+            Some(prepare_memory_snapshots(
+                &roots,
+                &project_dir_to_sync,
+            )?)
         } else {
-            added_count += 1;
-            SyncOperation::Added
+            None
         };
+        drop(memory_stage);
+        let setup_stage = super::push_diagnostics::Stage::start("repository_setup");
 
-        // Write the session file unless identical content is already there
-        if should_write_session(
-            operation,
-            existing.map(|s| Path::new(s.file_path.as_str())),
-            &dest_path,
-        ) {
-            session.write_to_file(&dest_path)?;
+        // Set up LFS if enabled
+        if filter.enable_lfs {
+            if verbosity != VerbosityLevel::Quiet {
+                println!("  {} Git LFS...", "Configuring".cyan());
+            }
+            scm::lfs::setup(&state.sync_repo_path, &filter.lfs_patterns)
+                .context("Failed to set up Git LFS")?;
         }
 
-        // Track this session in pushed conversations
-        let relative_path_str = relative_path.to_string_lossy().to_string();
-        match ConversationSummary::new(
-            session.session_id.clone(),
-            relative_path_str.clone(),
-            session.latest_timestamp(),
-            session.message_count(),
-            operation,
-        ) {
-            Ok(summary) => pushed_conversations.push(summary),
-            Err(e) => log::warn!("Failed to create summary for {}: {}", relative_path_str, e),
+        // The Claude root and every external mapping were checked before repository writes.
+        if filter.external_projects_root.is_none() {
+            validate_directory_root(&claude_dir)?;
         }
-    }
 
-    // ============================================================================
-    // SHOW SUMMARY AND INTERACTIVE CONFIRMATION
-    // ============================================================================
-    if verbosity != VerbosityLevel::Quiet {
-        println!();
-        println!("{}", "Push Summary:".bold().cyan());
-        println!("  {} Added: {}", "•".green(), added_count);
-        println!("  {} Modified: {}", "•".yellow(), modified_count);
-        println!("  {} Unchanged: {}", "•".dimmed(), unchanged_count);
-        let total_with_cwd = sessions.len().saturating_sub(skipped_no_cwd);
-        println!("  {} Skipped (no cwd): {}", "•".dimmed(), skipped_no_cwd);
-        println!(
-            "  {} Skipped (incomplete pull guard): {}",
-            "•".yellow(),
-            skipped_pull_guard
-        );
-        println!(
-            "  {} Sessions (with project context): {}",
-            "•".cyan(),
-            total_with_cwd
-        );
-        println!();
-    }
+        // Check directory structure consistency before pushing. The projects root
+        // is an untrusted checkout boundary: it must be a real directory inside
+        // the sync repository, never a symlink to an external tree.
+        let projects_dir = state.sync_repo_path.join(&filter.sync_subdirectory);
+        if !projects_dir.exists() {
+            fs::create_dir_all(&projects_dir)?;
+        }
+        let projects_dir = validate_sync_projects_root(&state.sync_repo_path, &projects_dir)?;
+        {
+            let structure_check =
+                check_directory_structure_consistency(&projects_dir, filter.use_project_name_only);
 
-    // Show detailed file list in verbose mode
-    if verbosity == VerbosityLevel::Verbose {
-        println!("{}", "Files to be pushed:".bold());
-        for (idx, session) in sessions.iter().enumerate().take(20) {
-            let Some(relative_path) = compute_relative_path(session)? else {
-                continue;
+            if !structure_check.is_consistent {
+                if let Some(warning) = &structure_check.warning {
+                    if verbosity != VerbosityLevel::Quiet {
+                        println!();
+                        println!("{}", "⚠️  目录结构不一致警告".yellow().bold());
+                        println!("{}", "─".repeat(50).dimmed());
+                        println!("{}", warning.yellow());
+                        println!();
+                    }
+
+                    if interactive && interactive_conflict::is_interactive() {
+                        let proceed = Confirm::new("是否继续推送？")
+                            .with_default(false)
+                            .with_help_message("建议先清理目录结构再继续")
+                            .prompt()
+                            .context("取消确认")?;
+
+                        if !proceed {
+                            println!("\n{}", "推送已取消。".yellow());
+                            println!(
+                                "提示：使用 '{}' 可以切换同步模式",
+                                format!(
+                                    "{} config --use-project-name-only <true|false>",
+                                    BINARY_NAME
+                                )
+                                .cyan()
+                            );
+                            return Ok(());
+                        }
+                    } else if verbosity != VerbosityLevel::Quiet {
+                        println!(
+                            "{}",
+                            "使用 --interactive 选项可以在不一致时选择是否继续".dimmed()
+                        );
+                    }
+                }
+            }
+        }
+
+        // Get the current branch name for operation record
+        let branch_name = branch
+            .map(|s| s.to_string())
+            .or_else(|| repo.current_branch().ok())
+            .unwrap_or_else(|| "main".to_string());
+
+        // Discover all sessions
+        if verbosity != VerbosityLevel::Quiet {
+            println!("  {} conversation sessions...", "Discovering".cyan());
+        }
+        if verbosity != VerbosityLevel::Quiet {
+            println!("  {} {} sessions", "Found".green(), sessions.len());
+        }
+
+        // Check for project name collisions when using project-name-only mode
+        if filter.use_project_name_only {
+            let collisions = find_colliding_projects(&claude_dir);
+            if !collisions.is_empty() && verbosity != VerbosityLevel::Quiet {
+                println!();
+                println!(
+                    "{}",
+                    "Warning: Multiple projects map to the same name:"
+                        .yellow()
+                        .bold()
+                );
+                for (name, paths) in &collisions {
+                    println!("  {} -> {} locations:", name.cyan(), paths.len());
+                    for path in paths.iter().take(3) {
+                        let display_path = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown");
+                        println!("    - {}", display_path);
+                    }
+                    if paths.len() > 3 {
+                        println!("    ... and {} more", paths.len() - 3);
+                    }
+                }
+                println!();
+                println!(
+                    "{}",
+                    "Sessions from colliding projects will be merged into the same directory."
+                        .yellow()
+                );
+                println!();
+            }
+        }
+
+        // ============================================================================
+        // COPY SESSIONS AND TRACK CHANGES
+        // ============================================================================
+        // Note: projects_dir was validated above as the trusted sync root.
+
+        // Discover existing sessions in sync repo to determine operation type
+        if verbosity != VerbosityLevel::Quiet {
+            println!("  {} sessions to sync repository...", "Copying".cyan());
+        }
+        drop(setup_stage);
+        let existing_stage = super::push_diagnostics::Stage::start("existing_discovery");
+        let existing_sessions = discover_sessions(&projects_dir, &filter)?;
+        let existing_map: HashMap<_, _> = existing_sessions
+            .iter()
+            .map(|s| (s.session_id.clone(), s))
+            .collect();
+        drop(existing_stage);
+        let hash_stage = super::push_diagnostics::Stage::start("hashes");
+        // A previous incomplete pull protects the guarded session/path across all
+        // later remote revisions until a pull completes the current revision.
+        // Corrupt guard state fails closed.
+        let pull_guard = PullGuardRegistry::load()?;
+
+        // content_hash re-serializes every entry; computed serially inside the copy
+        // loop it dominated push time, so precompute both sides in parallel.
+        use rayon::prelude::*;
+        let local_hashes: HashMap<String, String> = sessions
+            .par_iter()
+            .map(|s| (s.session_id.clone(), s.content_hash()))
+            .collect();
+        let existing_hashes: HashMap<String, String> = existing_sessions
+            .par_iter()
+            .map(|s| (s.session_id.clone(), s.content_hash()))
+            .collect();
+        drop(hash_stage);
+        let write_stage = super::push_diagnostics::Stage::start("session_writes");
+
+        // Track pushed conversations for operation record
+        let mut pushed_conversations: Vec<ConversationSummary> = Vec::new();
+        let mut added_count = 0;
+        let mut modified_count = 0;
+        let mut unchanged_count = 0;
+
+        // Track sessions skipped due to missing cwd
+        let mut skipped_no_cwd = 0;
+        let mut skipped_pull_guard = 0;
+
+        for session in &sessions {
+            let logical = Path::new(&session.file_path).strip_prefix(&claude_dir)?;
+            let (source_root, source_relative) =
+                roots.file_boundary(logical)?;
+            validate_regular_candidate(&source_root, &source_root.join(source_relative))?;
+            let relative_path = match compute_relative_path(session)? {
+                Some(path) => path,
+                None => {
+                    skipped_no_cwd += 1;
+                    log::debug!("Skipping session {} (no cwd)", session.session_id);
+                    continue;
+                }
             };
 
-            let status = if existing_map.contains_key(&session.session_id) {
+            let dest_path = safe_join_within_root(&projects_dir, &relative_path)?;
+
+            let existing = existing_map.get(&session.session_id);
+            if let Some(existing_remote) = existing {
+                if pull_guard.suppresses_push(
+                    &session.session_id,
+                    &relative_path,
+                    Path::new(&existing_remote.file_path),
+                )? {
+                    skipped_pull_guard += 1;
+                    log::warn!(
+                        "Skipping push for unresolved pull session {} at {}",
+                        session.session_id,
+                        relative_path.display()
+                    );
+                    continue;
+                }
+            }
+
+            // Determine operation type based on existing state
+            let operation = if existing.is_some() {
                 if existing_hashes.get(&session.session_id) == local_hashes.get(&session.session_id)
                 {
-                    "unchanged".dimmed()
+                    unchanged_count += 1;
+                    SyncOperation::Unchanged
                 } else {
-                    "modified".yellow()
+                    modified_count += 1;
+                    SyncOperation::Modified
                 }
             } else {
-                "new".green()
+                added_count += 1;
+                SyncOperation::Added
             };
 
-            println!("  {}. {} [{}]", idx + 1, relative_path.display(), status);
-        }
-        if sessions.len() > 20 {
-            println!("  ... and {} more", sessions.len() - 20);
-        }
-        println!();
-    }
+            // Write the session file unless identical content is already there
+            if should_write_session(
+                operation,
+                existing.map(|s| Path::new(s.file_path.as_str())),
+                &dest_path,
+            ) {
+                roots.session_project_root(Path::new(&session.file_path))?;
+                session.write_to_file(&dest_path)?;
+            }
 
-    // Interactive confirmation
-    if interactive && interactive_conflict::is_interactive() {
-        let confirm = Confirm::new("Do you want to proceed with pushing these changes?")
-            .with_default(true)
-            .with_help_message("This will commit and push to the sync repository")
-            .prompt()
-            .context("Failed to get confirmation")?;
-
-        if !confirm {
-            println!("\n{}", "Push cancelled.".yellow());
-            return Ok(());
+            // Track this session in pushed conversations
+            let relative_path_str = relative_path.to_string_lossy().to_string();
+            match ConversationSummary::new(
+                session.session_id.clone(),
+                relative_path_str.clone(),
+                session.latest_timestamp(),
+                session.message_count(),
+                operation,
+            ) {
+                Ok(summary) => pushed_conversations.push(summary),
+                Err(e) => log::warn!("Failed to create summary for {}: {}", relative_path_str, e),
+            }
         }
-    }
+        drop(write_stage);
+        let missing_stage = super::push_diagnostics::Stage::start("missing_sessions");
 
-    // ============================================================================
-    // SYNC DEVICE CONFIGURATION (if enabled)
-    // ============================================================================
-    if sync_config && filter.config_sync.enabled && filter.config_sync.push_with_config {
+        // ============================================================================
+        // SHOW SUMMARY AND INTERACTIVE CONFIRMATION
+        // ============================================================================
         if verbosity != VerbosityLevel::Quiet {
             println!();
-            println!("  {} device configuration...", "Syncing".cyan());
+            println!("{}", "Push Summary:".bold().cyan());
+            println!("  {} Added: {}", "•".green(), added_count);
+            println!("  {} Modified: {}", "•".yellow(), modified_count);
+            println!("  {} Unchanged: {}", "•".dimmed(), unchanged_count);
+            let total_with_cwd = sessions.len().saturating_sub(skipped_no_cwd);
+            println!("  {} Skipped (no cwd): {}", "•".dimmed(), skipped_no_cwd);
+            println!(
+                "  {} Skipped (incomplete pull guard): {}",
+                "•".yellow(),
+                skipped_pull_guard
+            );
+            println!(
+                "  {} Sessions (with project context): {}",
+                "•".cyan(),
+                total_with_cwd
+            );
+            println!();
         }
 
-        // Use config_sync handler to push configuration files (no commit)
-        match crate::handlers::config_sync::push_config_files(&filter.config_sync) {
-            Ok(synced_files) => {
-                if !synced_files.is_empty() {
-                    if verbosity != VerbosityLevel::Quiet {
-                        println!("  {} Device configuration synced:", "✓".green());
-                        for file in &synced_files {
-                            println!("    - {}", file.dimmed());
-                        }
+        // Show detailed file list in verbose mode
+        if verbosity == VerbosityLevel::Verbose {
+            println!("{}", "Files to be pushed:".bold());
+            for (idx, session) in sessions.iter().enumerate().take(20) {
+                let Some(relative_path) = compute_relative_path(session)? else {
+                    continue;
+                };
+
+                let status = if existing_map.contains_key(&session.session_id) {
+                    if existing_hashes.get(&session.session_id)
+                        == local_hashes.get(&session.session_id)
+                    {
+                        "unchanged".dimmed()
+                    } else {
+                        "modified".yellow()
                     }
-                } else if verbosity == VerbosityLevel::Verbose {
-                    println!("  {} No configuration files to sync", "ℹ".dimmed());
-                }
+                } else {
+                    "new".green()
+                };
+
+                println!("  {}. {} [{}]", idx + 1, relative_path.display(), status);
             }
-            Err(e) => {
-                log::warn!("Failed to sync device configuration: {}", e);
-                if verbosity != VerbosityLevel::Quiet {
-                    println!(
-                        "  {} Failed to sync device configuration: {}",
-                        "⚠".yellow(),
-                        e
-                    );
-                }
+            if sessions.len() > 20 {
+                println!("  ... and {} more", sessions.len() - 20);
+            }
+            println!();
+        }
+
+        // Interactive confirmation
+        if interactive && interactive_conflict::is_interactive() {
+            let confirm = Confirm::new("Do you want to proceed with pushing these changes?")
+                .with_default(true)
+                .with_help_message("This will commit and push to the sync repository")
+                .prompt()
+                .context("Failed to get confirmation")?;
+
+            if !confirm {
+                println!("\n{}", "Push cancelled.".yellow());
+                return Ok(());
             }
         }
-    }
 
-    // ============================================================================
-    // DETECT LOCALLY-MISSING SESSIONS IN SYNC REPO
-    // ============================================================================
-    // Compare sync repo files against local files to find sessions that exist
-    // in the repo but are missing locally. Only consider sync-repo project
-    // dirs that have a corresponding local project dir — this prevents
-    // touching sessions pushed by other devices for projects absent here.
-    //
-    // These missing sessions are either:
-    //   * accidental local loss → protected by default (kept in repo),
-    //   * force-pruned when `--prune` is set.
-    let mut deleted_from_repo = 0;
+        // ============================================================================
+        // SYNC DEVICE CONFIGURATION (if enabled)
+        // ============================================================================
+        if sync_config && filter.config_sync.enabled && filter.config_sync.push_with_config {
+            if verbosity != VerbosityLevel::Quiet {
+                println!();
+                println!("  {} device configuration...", "Syncing".cyan());
+            }
 
-    let missing_in_repo: Vec<PathBuf> = {
-        // Build a set of local session file names grouped by project dir name
-        // (the encoded directory name under ~/.claude/projects/)
-        let mut local_files_by_project: HashMap<String, std::collections::HashSet<String>> =
-            HashMap::new();
-
-        if let Ok(entries) = fs::read_dir(&claude_dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let local_project_dir = entry.path();
-                if !local_project_dir.is_dir() {
-                    continue;
-                }
-                let dir_name = local_project_dir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or_default()
-                    .to_string();
-                if dir_name.starts_with('.') {
-                    continue;
-                }
-
-                let mut file_names = std::collections::HashSet::new();
-                if let Ok(files) = fs::read_dir(&local_project_dir) {
-                    for file in files.filter_map(|f| f.ok()) {
-                        if let Some(name) = file.file_name().to_str() {
-                            if name.ends_with(".jsonl") {
-                                file_names.insert(name.to_string());
+            // Use config_sync handler to push configuration files (no commit)
+            match crate::handlers::config_sync::push_config_files(&filter.config_sync) {
+                Ok(synced_files) => {
+                    if !synced_files.is_empty() {
+                        if verbosity != VerbosityLevel::Quiet {
+                            println!("  {} Device configuration synced:", "✓".green());
+                            for file in &synced_files {
+                                println!("    - {}", file.dimmed());
                             }
                         }
+                    } else if verbosity == VerbosityLevel::Verbose {
+                        println!("  {} No configuration files to sync", "ℹ".dimmed());
                     }
                 }
-                local_files_by_project.insert(dir_name, file_names);
+                Err(e) => {
+                    log::warn!("Failed to sync device configuration: {}", e);
+                    if verbosity != VerbosityLevel::Quiet {
+                        println!(
+                            "  {} Failed to sync device configuration: {}",
+                            "⚠".yellow(),
+                            e
+                        );
+                    }
+                }
             }
         }
 
-        collect_missing_repo_sessions(&projects_dir, &filter, &sessions, &local_files_by_project)
-    };
+        // ============================================================================
+        // DETECT LOCALLY-MISSING SESSIONS IN SYNC REPO
+        // ============================================================================
+        // Compare sync repo files against local files to find sessions that exist
+        // in the repo but are missing locally. Only consider sync-repo project
+        // dirs that have a corresponding local project dir — this prevents
+        // touching sessions pushed by other devices for projects absent here.
+        //
+        // These missing sessions are either:
+        //   * accidental local loss → protected by default (kept in repo),
+        //   * force-pruned when `--prune` is set.
+        let mut deleted_from_repo = 0;
 
-    // Delete-unlock window: when active, treat ordinary locally-missing sessions as
-    // intentional deletions (same as --prune, no tombstone). Maintenance-suppressed
-    // Claude sessions remain protected unless the user explicitly passes --prune.
-    let unlock_remaining = crate::sync::delete_unlock::status().ok().flatten();
-    let action = decide_missing_action(prune, unlock_remaining);
-    let maintenance_state = if missing_in_repo.is_empty() {
-        None
-    } else {
-        match ConfigManager::config_dir().and_then(|config_dir| {
-            crate::session_maintenance::state::StateStore::from_config_dir(&config_dir).load()
-        }) {
-            Ok(state) => Some(state),
-            Err(error) => {
-                if matches!(action, MissingAction::PruneUnlock(_)) {
-                    return Err(error).context(
-                        "maintenance state is unavailable; refusing delete-unlock prune. "
-                            .to_string()
-                            + "Repair the state file or use explicit --prune",
-                    );
+        let missing_in_repo: Vec<PathBuf> = {
+            // Build a set of local session file names grouped by project dir name
+            // (the encoded directory name under ~/.claude/projects/)
+            let mut local_files_by_project: HashMap<String, std::collections::HashSet<String>> =
+                HashMap::new();
+
+            for expected in roots.roots() {
+                let root = roots.resolve(&expected.logical_root)?;
+                let mut file_names = std::collections::HashSet::new();
+                for file in fs::read_dir(&root.physical_root)? {
+                    let file = file?;
+                    if let Some(name) = file.file_name().to_str() {
+                        if name.ends_with(".jsonl") {
+                            file_names.insert(name.to_string());
+                        }
+                    }
                 }
-                log::warn!(
+                local_files_by_project.insert(root.project_dir, file_names);
+            }
+
+            collect_missing_repo_sessions(
+                &projects_dir,
+                &filter,
+                &sessions,
+                &local_files_by_project,
+            )
+        };
+
+        // Delete-unlock window: when active, treat ordinary locally-missing sessions as
+        // intentional deletions (same as --prune, no tombstone). Maintenance-suppressed
+        // Claude sessions remain protected unless the user explicitly passes --prune.
+        let unlock_remaining = if scheduled {
+            None
+        } else {
+            crate::sync::delete_unlock::status().ok().flatten()
+        };
+        let action = decide_missing_action(prune, unlock_remaining);
+        let maintenance_state = if missing_in_repo.is_empty() {
+            None
+        } else {
+            match ConfigManager::config_dir().and_then(|config_dir| {
+                crate::session_maintenance::state::StateStore::from_config_dir(&config_dir).load()
+            }) {
+                Ok(state) => Some(state),
+                Err(error) => {
+                    if matches!(action, MissingAction::PruneUnlock(_)) {
+                        return Err(error).context(
+                            "maintenance state is unavailable; refusing delete-unlock prune. "
+                                .to_string()
+                                + "Repair the state file or use explicit --prune",
+                        );
+                    }
+                    log::warn!(
                     "Failed to load maintenance state; continuing without suppression classification: {}",
                     error
                 );
-                None
+                    None
+                }
             }
-        }
-    };
-    let (_suppressed_missing, ordinary_missing) =
-        partition_missing_repo_sessions(&missing_in_repo, maintenance_state.as_ref());
+        };
+        let (_suppressed_missing, ordinary_missing) =
+            partition_missing_repo_sessions(&missing_in_repo, maintenance_state.as_ref());
 
-    if missing_in_repo.is_empty() {
-        // Nothing missing locally — no protection or pruning needed.
-    } else {
-        match action {
-            MissingAction::PruneManual | MissingAction::PruneUnlock(_) => {
-                let mut actionable_missing =
-                    missing_for_action(&missing_in_repo, maintenance_state.as_ref(), &action);
-                actionable_missing.retain(|relative| {
-                    let remote_file = projects_dir.join(relative);
-                    !pull_guard
-                        .protects_remote_path(relative, &remote_file)
-                        .unwrap_or(true)
-                });
-                // Physical sync of the deletion. No tombstone is written —
-                // prune/window are physical syncs, not intentional-delete
-                // registrations.
-                match prune_missing_repo_sessions(
-                    &state.sync_repo_path,
-                    &projects_dir,
-                    &actionable_missing,
-                ) {
-                    Ok(count) => {
-                        deleted_from_repo = count;
-                        for relative in &actionable_missing {
-                            log::debug!("Pruned missing session: {}", relative.display());
+        if missing_in_repo.is_empty() {
+            // Nothing missing locally — no protection or pruning needed.
+        } else {
+            match action {
+                MissingAction::PruneManual | MissingAction::PruneUnlock(_) => {
+                    let mut actionable_missing =
+                        missing_for_action(&missing_in_repo, maintenance_state.as_ref(), &action);
+                    actionable_missing.retain(|relative| {
+                        let remote_file = projects_dir.join(relative);
+                        !pull_guard
+                            .protects_remote_path(relative, &remote_file)
+                            .unwrap_or(true)
+                    });
+                    // Physical sync of the deletion. No tombstone is written —
+                    // prune/window are physical syncs, not intentional-delete
+                    // registrations.
+                    match prune_missing_repo_sessions(
+                        &state.sync_repo_path,
+                        &projects_dir,
+                        &actionable_missing,
+                    ) {
+                        Ok(count) => {
+                            deleted_from_repo = count;
+                            for relative in &actionable_missing {
+                                log::debug!("Pruned missing session: {}", relative.display());
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!("Failed to prune missing sessions safely: {}", error);
                         }
                     }
-                    Err(error) => {
-                        log::warn!("Failed to prune missing sessions safely: {}", error);
-                    }
-                }
-                if verbosity != VerbosityLevel::Quiet {
-                    match action {
-                        MissingAction::PruneUnlock(mins) => {
-                            println!(
+                    if verbosity != VerbosityLevel::Quiet {
+                        match action {
+                            MissingAction::PruneUnlock(mins) => {
+                                println!(
                                 "  {} 删除放行窗口生效中，已同步删除 {} 个 session（剩余 {} 分钟）",
                                 "🔓".yellow(),
                                 deleted_from_repo,
                                 mins
                             );
-                        }
-                        _ => {
-                            println!(
-                                "  {} Pruned {} missing sessions from sync repo",
-                                "✓".green(),
-                                deleted_from_repo
-                            );
+                            }
+                            _ => {
+                                println!(
+                                    "  {} Pruned {} missing sessions from sync repo",
+                                    "✓".green(),
+                                    deleted_from_repo
+                                );
+                            }
                         }
                     }
                 }
-            }
-            MissingAction::Protect => {
-                // Protection mode: refuse to propagate the local absence. The
-                // repo keeps these sessions so they survive as a recoverable
-                // backup. Suppressed maintenance sessions are intentionally
-                // omitted from this warning because their absence is expected.
-                if !ordinary_missing.is_empty() && verbosity != VerbosityLevel::Quiet {
-                    println!(
+                MissingAction::Protect => {
+                    // Protection mode: refuse to propagate the local absence. The
+                    // repo keeps these sessions so they survive as a recoverable
+                    // backup. Suppressed maintenance sessions are intentionally
+                    // omitted from this warning because their absence is expected.
+                    if !ordinary_missing.is_empty() && verbosity != VerbosityLevel::Quiet {
+                        println!(
                         "  {} Detected {} session(s) missing locally but present in sync repo — protected from deletion.",
                         "⚠".yellow(),
                         ordinary_missing.len()
                     );
-                    println!(
-                        "    {} Use '{}' to recover them, or '{}' to force-delete.",
-                        "→".cyan(),
-                        format!("{} session restore", BINARY_NAME).cyan(),
-                        format!("{} push --prune", BINARY_NAME).cyan()
-                    );
-                }
-                if !ordinary_missing.is_empty() {
-                    log::info!(
+                        println!(
+                            "    {} Use '{}' to recover them, or '{}' to force-delete.",
+                            "→".cyan(),
+                            format!("{} session restore", BINARY_NAME).cyan(),
+                            format!("{} push --prune", BINARY_NAME).cyan()
+                        );
+                    }
+                    if !ordinary_missing.is_empty() {
+                        log::info!(
                         "Protected {} missing sessions from deletion (use --prune or unlock-delete to force)",
                         ordinary_missing.len()
                     );
-                }
-            }
-        }
-    }
-
-    // ============================================================================
-    // SYNC AUTO MEMORY DIRECTORIES
-    // ============================================================================
-    if filter.auto_memory.enabled {
-        if verbosity != VerbosityLevel::Quiet {
-            println!();
-            println!("  {} auto memory directories...", "Syncing".cyan());
-        }
-
-        let (synced_count, deleted_memory_count) = sync_auto_memory_directories(
-            &state.sync_repo_path,
-            &projects_dir,
-            &claude_dir,
-            &project_dir_to_sync,
-        )?;
-
-        if synced_count > 0 {
-            if verbosity != VerbosityLevel::Quiet {
-                println!(
-                    "  {} Synced {} memory directories",
-                    "✓".green(),
-                    synced_count
-                );
-            }
-        } else if verbosity == VerbosityLevel::Verbose {
-            println!("  {} No memory directories found", "ℹ".dimmed());
-        }
-
-        if deleted_memory_count > 0 && verbosity != VerbosityLevel::Quiet {
-            println!(
-                "  {} Removed {} deleted memory files from sync repo",
-                "✓".green(),
-                deleted_memory_count
-            );
-        }
-    }
-
-    // ============================================================================
-    // COMMIT AND PUSH CHANGES
-    // ============================================================================
-    repo.stage_all()?;
-
-    let has_changes = repo.has_changes()?;
-    if has_changes {
-        // Get the current commit hash before making any changes
-        // This allows us to undo the push later by resetting to this commit
-        // Note: We don't create file snapshots for push - git already has history!
-        // Undo push simply does `git reset` to this commit.
-        // On a brand new repo with no commits, this will be None (no undo available for first push)
-        let commit_before_push = repo.current_commit_hash().ok();
-
-        if let Some(ref hash) = commit_before_push {
-            if verbosity != VerbosityLevel::Quiet {
-                println!("  {} Recorded commit {} for undo", "✓".green(), &hash[..8]);
-            }
-        } else if verbosity != VerbosityLevel::Quiet {
-            println!(
-                "  {} First push - no previous commit to undo to",
-                "ℹ".cyan()
-            );
-        }
-
-        let default_message = format!(
-            "Sync {} sessions at {}",
-            sessions.len(),
-            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
-        );
-        let message = commit_message.unwrap_or(&default_message);
-
-        if verbosity != VerbosityLevel::Quiet {
-            println!("  {} changes...", "Committing".cyan());
-        }
-        repo.commit(message)?;
-        if verbosity != VerbosityLevel::Quiet {
-            println!("  {} Committed: {}", "✓".green(), message);
-        }
-
-        // Track whether push failed so we can propagate the error
-        // after saving the operation record (undo information).
-        let mut push_error: Option<anyhow::Error> = None;
-
-        // Push to remote if configured
-        if push_remote && state.has_remote {
-            if verbosity != VerbosityLevel::Quiet {
-                println!("  {} to remote...", "Pushing".cyan());
-            }
-
-            let repo_path = state.sync_repo_path.clone();
-            match push_with_rebase_auto_heal(
-                repo.as_ref(),
-                &repo_path,
-                &mut state,
-                &branch_name,
-                verbosity,
-            ) {
-                Ok(PushResult::Clean) => {
-                    if verbosity != VerbosityLevel::Quiet {
-                        println!("  {} Pushed to origin/{}", "✓".green(), branch_name);
                     }
                 }
-                Ok(PushResult::Degraded { conflicts }) => {
-                    if verbosity != VerbosityLevel::Quiet {
+            }
+        }
+        drop(missing_stage);
+        let memory_write_stage = super::push_diagnostics::Stage::start("memory_writes");
+
+        // ============================================================================
+        // SYNC AUTO MEMORY DIRECTORIES
+        // ============================================================================
+        if filter.auto_memory.enabled {
+            if verbosity != VerbosityLevel::Quiet {
+                println!();
+                println!("  {} auto memory directories...", "Syncing".cyan());
+            }
+
+            let (synced_count, deleted_memory_count) = sync_auto_memory_directories(
+                &state.sync_repo_path,
+                &projects_dir,
+                &roots,
+                &project_dir_to_sync,
+                scheduled,
+                memory_snapshots.as_deref(),
+            )?;
+
+            if synced_count > 0 {
+                if verbosity != VerbosityLevel::Quiet {
+                    println!(
+                        "  {} Synced {} memory directories",
+                        "✓".green(),
+                        synced_count
+                    );
+                }
+            } else if verbosity == VerbosityLevel::Verbose {
+                println!("  {} No memory directories found", "ℹ".dimmed());
+            }
+
+            if deleted_memory_count > 0 && verbosity != VerbosityLevel::Quiet {
+                println!(
+                    "  {} Removed {} deleted memory files from sync repo",
+                    "✓".green(),
+                    deleted_memory_count
+                );
+            }
+        }
+        drop(memory_write_stage);
+        let commit_stage = super::push_diagnostics::Stage::start("commit_remote");
+
+        // ============================================================================
+        // COMMIT AND PUSH CHANGES
+        // ============================================================================
+        repo.stage_all()?;
+
+        let has_changes = repo.has_changes()?;
+        scheduled_changed = has_changes;
+        if has_changes {
+            // Get the current commit hash before making any changes
+            // This allows us to undo the push later by resetting to this commit
+            // Note: We don't create file snapshots for push - git already has history!
+            // Undo push simply does `git reset` to this commit.
+            // On a brand new repo with no commits, this will be None (no undo available for first push)
+            let commit_before_push = repo.current_commit_hash().ok();
+
+            if let Some(ref hash) = commit_before_push {
+                if verbosity != VerbosityLevel::Quiet {
+                    println!("  {} Recorded commit {} for undo", "✓".green(), &hash[..8]);
+                }
+            } else if verbosity != VerbosityLevel::Quiet {
+                println!(
+                    "  {} First push - no previous commit to undo to",
+                    "ℹ".cyan()
+                );
+            }
+
+            let default_message = format!(
+                "Sync {} sessions at {}",
+                sessions.len(),
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+            );
+            let message = commit_message.unwrap_or(&default_message);
+
+            if verbosity != VerbosityLevel::Quiet {
+                println!("  {} changes...", "Committing".cyan());
+            }
+            repo.commit(message)?;
+            if verbosity != VerbosityLevel::Quiet {
+                println!("  {} Committed: {}", "✓".green(), message);
+            }
+
+            // Track whether push failed so we can propagate the error
+            // after saving the operation record (undo information).
+            let mut push_error: Option<anyhow::Error> = None;
+
+            // Push to remote if configured
+            if push_remote && state.has_remote {
+                if verbosity != VerbosityLevel::Quiet {
+                    println!("  {} to remote...", "Pushing".cyan());
+                }
+
+                let repo_path = state.sync_repo_path.clone();
+                match push_with_rebase_auto_heal(
+                    repo.as_ref(),
+                    &repo_path,
+                    &mut state,
+                    &branch_name,
+                    verbosity,
+                ) {
+                    Ok(PushResult::Clean) => {
+                        if verbosity != VerbosityLevel::Quiet {
+                            println!("  {} Pushed to origin/{}", "✓".green(), branch_name);
+                        }
+                    }
+                    Ok(PushResult::Degraded { conflicts }) => {
+                        if verbosity != VerbosityLevel::Quiet {
+                            println!(
+                                "  {} Push degraded; kept {} conflict file(s)",
+                                "⚠".yellow(),
+                                conflicts.len()
+                            );
+                        }
+                    }
+                    Ok(PushResult::NothingToPush) => {}
+                    Err(e) => {
+                        log::warn!("Failed to push: {}", e);
+                        if verbosity != VerbosityLevel::Quiet {
+                            println!("  {} Failed to push: {}", "⚠".yellow(), e);
+                        }
+                        push_error = Some(e);
+                    }
+                }
+            }
+
+            // ============================================================================
+            // CREATE AND SAVE OPERATION RECORD
+            // ============================================================================
+            let mut operation_record = OperationRecord::new(
+                OperationType::Push,
+                Some(branch_name.clone()),
+                pushed_conversations.clone(),
+            );
+
+            // Store commit hash for undo (no file snapshot needed - git has history)
+            // On first push (no prior commits), this will be None
+            operation_record.commit_hash = commit_before_push;
+
+            // Load operation history and add this operation
+            let mut history = match OperationHistory::load() {
+                Ok(h) => h,
+                Err(e) => {
+                    log::warn!("Failed to load operation history: {}", e);
+                    log::info!("Creating new history...");
+                    OperationHistory::default()
+                }
+            };
+
+            if let Err(e) = history.add_operation(operation_record) {
+                log::warn!("Failed to save operation to history: {}", e);
+                log::info!("Push completed successfully, but history was not updated.");
+            }
+
+            // If push failed, propagate the error so the process exits with non-zero code.
+            // The operation record is already saved above, preserving undo capability.
+            if let Some(e) = push_error {
+                return Err(e);
+            }
+        } else if verbosity != VerbosityLevel::Quiet {
+            println!("  {} No changes to commit", "Note:".yellow());
+        }
+        drop(commit_stage);
+
+        // ============================================================================
+        // DISPLAY SUMMARY TO USER
+        // ============================================================================
+        if verbosity != VerbosityLevel::Quiet {
+            println!("\n{}", "=== Push Summary ===".bold().cyan());
+
+            // Show operation statistics
+            let stats_msg = if deleted_from_repo > 0 {
+                format!(
+                    "  {} Added    {} Modified    {} Deleted    {} Unchanged",
+                    format!("{added_count}").green(),
+                    format!("{modified_count}").cyan(),
+                    format!("{deleted_from_repo}").red(),
+                    format!("{unchanged_count}").dimmed(),
+                )
+            } else {
+                format!(
+                    "  {} Added    {} Modified    {} Unchanged",
+                    format!("{added_count}").green(),
+                    format!("{modified_count}").cyan(),
+                    format!("{unchanged_count}").dimmed(),
+                )
+            };
+            println!("{stats_msg}");
+            println!();
+
+            // Group conversations by project (top-level directory)
+            let mut by_project: HashMap<String, Vec<&ConversationSummary>> = HashMap::new();
+            for conv in &pushed_conversations {
+                // Skip unchanged conversations in detailed output
+                if conv.operation == SyncOperation::Unchanged {
+                    continue;
+                }
+
+                let project = conv
+                    .project_path
+                    .split('/')
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_string();
+                by_project.entry(project).or_default().push(conv);
+            }
+
+            // Display conversations grouped by project
+            if !by_project.is_empty() {
+                println!("{}", "Pushed Conversations:".bold());
+
+                let mut projects: Vec<_> = by_project.keys().collect();
+                projects.sort();
+
+                for project in projects {
+                    let conversations = &by_project[project];
+                    println!("\n  {} {}/", "Project:".bold(), project.cyan());
+
+                    for conv in conversations.iter().take(MAX_CONVERSATIONS_TO_DISPLAY) {
+                        let operation_str = match conv.operation {
+                            SyncOperation::Added => "ADD".green(),
+                            SyncOperation::Modified => "MOD".cyan(),
+                            SyncOperation::Conflict => "CONFLICT".yellow(),
+                            SyncOperation::Unchanged => "---".dimmed(),
+                        };
+
+                        let timestamp_str = conv
+                            .timestamp
+                            .as_ref()
+                            .and_then(|t| {
+                                // Extract just the date portion for compact display
+                                t.split('T').next()
+                            })
+                            .unwrap_or("unknown");
+
                         println!(
-                            "  {} Push degraded; kept {} conflict file(s)",
-                            "⚠".yellow(),
-                            conflicts.len()
+                            "    {} {} ({}msg, {})",
+                            operation_str,
+                            conv.project_path,
+                            conv.message_count,
+                            timestamp_str.dimmed()
+                        );
+                    }
+
+                    if conversations.len() > MAX_CONVERSATIONS_TO_DISPLAY {
+                        println!(
+                            "    {} ... and {} more conversations",
+                            "...".dimmed(),
+                            conversations.len() - MAX_CONVERSATIONS_TO_DISPLAY
                         );
                     }
                 }
-                Ok(PushResult::NothingToPush) => {}
-                Err(e) => {
-                    log::warn!("Failed to push: {}", e);
-                    if verbosity != VerbosityLevel::Quiet {
-                        println!("  {} Failed to push: {}", "⚠".yellow(), e);
-                    }
-                    push_error = Some(e);
-                }
             }
+
+            println!("\n{}", "Push complete!".green().bold());
         }
 
-        // ============================================================================
-        // CREATE AND SAVE OPERATION RECORD
-        // ============================================================================
-        let mut operation_record = OperationRecord::new(
-            OperationType::Push,
-            Some(branch_name.clone()),
-            pushed_conversations.clone(),
-        );
-
-        // Store commit hash for undo (no file snapshot needed - git has history)
-        // On first push (no prior commits), this will be None
-        operation_record.commit_hash = commit_before_push;
-
-        // Load operation history and add this operation
-        let mut history = match OperationHistory::load() {
-            Ok(h) => h,
-            Err(e) => {
-                log::warn!("Failed to load operation history: {}", e);
-                log::info!("Creating new history...");
-                OperationHistory::default()
+        // Scheduled runs do not mutate unrelated snapshot maintenance state.
+        if !scheduled {
+            if let Err(e) = crate::undo::cleanup_old_snapshots(None, false) {
+                log::warn!("Failed to cleanup old snapshots: {}", e);
             }
+        }
+        Ok(())
+    })();
+    if scheduled {
+        use crate::handlers::schedule::{record_result, ScheduledOutcome};
+        let outcome = match &result {
+            Err(_) => ScheduledOutcome::Error,
+            Ok(()) if scheduled_changed => ScheduledOutcome::Success,
+            Ok(()) => ScheduledOutcome::NoChanges,
         };
-
-        if let Err(e) = history.add_operation(operation_record) {
-            log::warn!("Failed to save operation to history: {}", e);
-            log::info!("Push completed successfully, but history was not updated.");
-        }
-
-        // If push failed, propagate the error so the process exits with non-zero code.
-        // The operation record is already saved above, preserving undo capability.
-        if let Some(e) = push_error {
-            return Err(e);
-        }
-    } else if verbosity != VerbosityLevel::Quiet {
-        println!("  {} No changes to commit", "Note:".yellow());
+        record_result(
+            outcome,
+            result
+                .as_ref()
+                .err()
+                .map(|_| "scheduled push failed; inspect CCS log"),
+        )?;
     }
-
-    // ============================================================================
-    // DISPLAY SUMMARY TO USER
-    // ============================================================================
-    if verbosity != VerbosityLevel::Quiet {
-        println!("\n{}", "=== Push Summary ===".bold().cyan());
-
-        // Show operation statistics
-        let stats_msg = if deleted_from_repo > 0 {
-            format!(
-                "  {} Added    {} Modified    {} Deleted    {} Unchanged",
-                format!("{added_count}").green(),
-                format!("{modified_count}").cyan(),
-                format!("{deleted_from_repo}").red(),
-                format!("{unchanged_count}").dimmed(),
-            )
-        } else {
-            format!(
-                "  {} Added    {} Modified    {} Unchanged",
-                format!("{added_count}").green(),
-                format!("{modified_count}").cyan(),
-                format!("{unchanged_count}").dimmed(),
-            )
-        };
-        println!("{stats_msg}");
-        println!();
-
-        // Group conversations by project (top-level directory)
-        let mut by_project: HashMap<String, Vec<&ConversationSummary>> = HashMap::new();
-        for conv in &pushed_conversations {
-            // Skip unchanged conversations in detailed output
-            if conv.operation == SyncOperation::Unchanged {
-                continue;
-            }
-
-            let project = conv
-                .project_path
-                .split('/')
-                .next()
-                .unwrap_or("unknown")
-                .to_string();
-            by_project.entry(project).or_default().push(conv);
-        }
-
-        // Display conversations grouped by project
-        if !by_project.is_empty() {
-            println!("{}", "Pushed Conversations:".bold());
-
-            let mut projects: Vec<_> = by_project.keys().collect();
-            projects.sort();
-
-            for project in projects {
-                let conversations = &by_project[project];
-                println!("\n  {} {}/", "Project:".bold(), project.cyan());
-
-                for conv in conversations.iter().take(MAX_CONVERSATIONS_TO_DISPLAY) {
-                    let operation_str = match conv.operation {
-                        SyncOperation::Added => "ADD".green(),
-                        SyncOperation::Modified => "MOD".cyan(),
-                        SyncOperation::Conflict => "CONFLICT".yellow(),
-                        SyncOperation::Unchanged => "---".dimmed(),
-                    };
-
-                    let timestamp_str = conv
-                        .timestamp
-                        .as_ref()
-                        .and_then(|t| {
-                            // Extract just the date portion for compact display
-                            t.split('T').next()
-                        })
-                        .unwrap_or("unknown");
-
-                    println!(
-                        "    {} {} ({}msg, {})",
-                        operation_str,
-                        conv.project_path,
-                        conv.message_count,
-                        timestamp_str.dimmed()
-                    );
-                }
-
-                if conversations.len() > MAX_CONVERSATIONS_TO_DISPLAY {
-                    println!(
-                        "    {} ... and {} more conversations",
-                        "...".dimmed(),
-                        conversations.len() - MAX_CONVERSATIONS_TO_DISPLAY
-                    );
-                }
-            }
-        }
-
-        println!("\n{}", "Push complete!".green().bold());
-    }
-
-    // Clean up old snapshots automatically
-    if let Err(e) = crate::undo::cleanup_old_snapshots(None, false) {
-        log::warn!("Failed to cleanup old snapshots: {}", e);
-    }
-
-    Ok(())
+    result
 }
 
 #[cfg(test)]
@@ -1466,6 +1648,143 @@ mod tests {
     }
 
     #[test]
+    fn auto_memory_snapshot_preserves_preflight_bytes_and_scheduled_missing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let project = local.join("project");
+        let memory = project.join("memory");
+        let repo = temp.path().join("repo");
+        let projects = repo.join("projects");
+        let remote = projects.join("project/memory");
+        fs::create_dir_all(&memory).unwrap();
+        fs::create_dir_all(&remote).unwrap();
+        fs::write(memory.join("note.md"), b"preflight\0\xff").unwrap();
+        fs::write(remote.join("missing.md"), b"retain scheduled").unwrap();
+        let destinations = HashMap::from([(project, PathBuf::from("project"))]);
+        let roots = crate::project_roots::ProjectRootIndex::new(&local, &[]).unwrap();
+        let snapshots = prepare_memory_snapshots(&roots, &destinations).unwrap();
+        fs::write(memory.join("note.md"), b"changed after preflight").unwrap();
+        let result = sync_auto_memory_directories(
+            &repo,
+            &projects,
+            &roots,
+            &destinations,
+            true,
+            Some(&snapshots),
+        )
+        .unwrap();
+        assert_eq!(result, (1, 0));
+        assert_eq!(
+            fs::read(remote.join("note.md")).unwrap(),
+            b"preflight\0\xff"
+        );
+        assert_eq!(
+            fs::read(remote.join("missing.md")).unwrap(),
+            b"retain scheduled"
+        );
+        let result =
+            sync_auto_memory_directories(&repo, &projects, &roots, &destinations, false, None)
+                .unwrap();
+        assert_eq!(result, (1, 1));
+        assert_eq!(
+            fs::read(remote.join("note.md")).unwrap(),
+            b"changed after preflight"
+        );
+        assert!(!remote.join("missing.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_memory_preflight_failure_does_not_write_any_destination() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let repo = temp.path().join("repo");
+        let projects = repo.join("projects");
+        let good = local.join("good");
+        let bad = local.join("bad");
+        fs::create_dir_all(good.join("memory")).unwrap();
+        fs::create_dir_all(&bad).unwrap();
+        fs::create_dir_all(&projects).unwrap();
+        fs::write(good.join("memory/note.md"), b"must not publish").unwrap();
+        symlink(good.join("memory"), bad.join("memory")).unwrap();
+        let destinations =
+            HashMap::from([(good, PathBuf::from("good")), (bad, PathBuf::from("bad"))]);
+        let roots = crate::project_roots::ProjectRootIndex::new(&local, &[]).unwrap();
+        assert!(prepare_memory_snapshots(&roots, &destinations).is_err());
+        assert!(sync_auto_memory_directories(
+            &repo,
+            &projects,
+            &roots,
+            &destinations,
+            true,
+            None
+        )
+        .is_err());
+        assert!(!projects.join("good").exists());
+        assert!(!projects.join("bad").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_memory_snapshot_rejects_changed_link_without_destination_write() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let local = base.join("local");
+        let mount = base.join("volume");
+        let trusted = mount.join("trusted");
+        let target = trusted.join("project");
+        let logical = local.join("project");
+        let repo = base.join("repo");
+        let projects = repo.join("projects");
+        fs::create_dir_all(target.join("memory")).unwrap();
+        fs::create_dir_all(&local).unwrap();
+        fs::create_dir_all(&projects).unwrap();
+        fs::write(target.join("memory/note.md"), b"must not publish").unwrap();
+        symlink(&target, &logical).unwrap();
+        let volume_uuid = "AF9C9871-18AE-40C9-8D18-624E415520C6".to_owned();
+        let volume = crate::project_roots::VolumeIdentity {
+            device_id: fs::metadata(&mount).unwrap().dev(), mount_point: mount, volume_uuid: volume_uuid.clone(),
+        };
+        let mappings = [crate::project_roots::ProjectRootMapping {
+            project_dir: "project".into(), target: target.clone(), trusted_root: trusted, volume_uuid,
+        }];
+        crate::project_roots::with_test_volume(volume, || {
+            let roots = crate::project_roots::ProjectRootIndex::new(&local, &mappings).unwrap();
+            let destinations = HashMap::from([(logical.clone(), PathBuf::from("project"))]);
+            let snapshots = prepare_memory_snapshots(&roots, &destinations).unwrap();
+            fs::remove_file(&logical).unwrap();
+            symlink(&projects, &logical).unwrap();
+            assert!(sync_auto_memory_directories(&repo, &projects, &roots, &destinations, true, Some(&snapshots)).is_err());
+            assert!(!projects.join("project").exists());
+            assert_eq!(fs::read(target.join("memory/note.md")).unwrap(), b"must not publish");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_memory_snapshot_rechecks_project_before_write() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let project = local.join("project");
+        let repo = temp.path().join("repo");
+        let projects = repo.join("projects");
+        fs::create_dir_all(project.join("memory")).unwrap();
+        fs::create_dir_all(&projects).unwrap();
+        fs::write(project.join("memory/note.md"), b"must not publish").unwrap();
+        let destinations = HashMap::from([(project.clone(), PathBuf::from("project"))]);
+        let roots = crate::project_roots::ProjectRootIndex::new(&local, &[]).unwrap();
+        let snapshots = prepare_memory_snapshots(&roots, &destinations).unwrap();
+        let moved = temp.path().join("moved");
+        fs::rename(&project, &moved).unwrap();
+        symlink(&moved, &project).unwrap();
+        assert!(sync_auto_memory_directories(&repo, &projects, &roots, &destinations, true, Some(&snapshots)).is_err());
+        assert!(!projects.join("project").exists());
+    }
+
+    #[test]
     fn auto_memory_sync_writes_normal_destination_under_guarded_projects_root() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
@@ -1479,9 +1798,15 @@ mod tests {
         let mut mappings = HashMap::new();
         mappings.insert(local_project, PathBuf::from("project"));
 
-        let (synced, deleted) =
-            sync_auto_memory_directories(&repo, &projects, &temp.path().join("local"), &mappings)
-                .unwrap();
+        let (synced, deleted) = sync_auto_memory_directories(
+            &repo,
+            &projects,
+            &crate::project_roots::ProjectRootIndex::new(&temp.path().join("local"), &[]).unwrap(),
+            &mappings,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!((synced, deleted), (1, 0));
         assert_eq!(
             fs::read(projects.join("project/memory/note.md")).unwrap(),
@@ -1500,8 +1825,10 @@ mod tests {
             assert!(sync_auto_memory_directories(
                 repo,
                 projects,
-                local_project.parent().unwrap(),
+                &crate::project_roots::ProjectRootIndex::new(local_project.parent().unwrap(), &[]).unwrap(),
                 &mappings,
+                false,
+                None,
             )
             .is_err());
             assert_eq!(fs::read(outside_marker).unwrap(), b"must survive");
@@ -1588,9 +1915,9 @@ mod tests {
 
             let mut mappings = HashMap::new();
             mappings.insert(local_project, PathBuf::from("project"));
-            assert!(
-                sync_auto_memory_directories(&repo, &projects, &local_root, &mappings).is_err()
-            );
+            let result = crate::project_roots::ProjectRootIndex::new(&local_root, &[])
+                .and_then(|roots| sync_auto_memory_directories(&repo, &projects, &roots, &mappings, false, None));
+            assert!(result.is_err());
             assert!(!remote_memory.join("secret.md").exists());
             assert_eq!(fs::read(&remote_marker).unwrap(), b"must survive");
         }
@@ -1619,7 +1946,9 @@ mod tests {
 
         let mut mappings = HashMap::new();
         mappings.insert(local_root.join("project"), PathBuf::from("project"));
-        assert!(sync_auto_memory_directories(&repo, &projects, &local_root, &mappings).is_err());
+        let result = crate::project_roots::ProjectRootIndex::new(&local_root, &[])
+            .and_then(|roots| sync_auto_memory_directories(&repo, &projects, &roots, &mappings, false, None));
+        assert!(result.is_err());
         assert!(!remote_memory.join("secret.md").exists());
         assert_eq!(fs::read(&remote_marker).unwrap(), b"must survive");
     }

@@ -6,7 +6,7 @@ use super::summary::ConversationSummary;
 use super::types::{OperationType, SyncOperation};
 
 /// Record of a single sync operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OperationRecord {
     /// Type of operation (pull or push)
     pub operation_type: OperationType,

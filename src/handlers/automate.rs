@@ -41,6 +41,11 @@ pub fn handle_automate_status() -> Result<()> {
     println!("{}", "Claude Code Auto-Sync Status".cyan().bold());
     println!("{}", "═".repeat(40).dimmed());
     println!();
+    if !super::hooks::runtime_hooks_enabled() {
+        println!("Hooks: disabled (runtime pause)");
+        println!("Wrapper installed: {}", is_wrapper_installed()?);
+        return Ok(());
+    }
 
     // Check hooks
     let hooks_installed = are_hooks_installed()?;

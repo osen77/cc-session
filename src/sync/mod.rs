@@ -5,6 +5,7 @@ mod init;
 mod pull;
 pub(crate) mod pull_guard;
 mod push;
+pub(crate) mod push_diagnostics;
 mod remote;
 pub(crate) mod repo_lock;
 pub(crate) mod session_write;
@@ -60,6 +61,7 @@ pub fn sync_bidirectional(
         true,
         interactive,
         prune,
+        false,
         verbosity,
     )?;
 
@@ -87,6 +89,17 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
+    struct ConfigEnvGuard(Option<std::ffi::OsString>);
+
+    impl Drop for ConfigEnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var(CONFIG_DIR_ENV, value),
+                None => std::env::remove_var(CONFIG_DIR_ENV),
+            }
+        }
+    }
+
     #[test]
     #[serial]
     fn test_url_validation() {
@@ -99,6 +112,7 @@ mod tests {
         // Isolate config directory to avoid overwriting real state.json
         let config_dir = temp_dir.path().join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
+        let _config_env = ConfigEnvGuard(std::env::var_os(CONFIG_DIR_ENV));
         std::env::set_var(CONFIG_DIR_ENV, &config_dir);
 
         // Save a test state
@@ -132,8 +146,6 @@ mod tests {
             assert!(error_msg.contains("Invalid URL format"));
         }
 
-        // Cleanup
-        std::env::remove_var(CONFIG_DIR_ENV);
     }
 
     #[test]

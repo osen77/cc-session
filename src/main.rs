@@ -13,6 +13,7 @@ mod omp;
 mod onboarding;
 mod parser;
 mod path_security;
+mod project_roots;
 mod report;
 mod scm;
 mod session_cache;
@@ -101,6 +102,9 @@ enum Commands {
         /// sessions are protected and kept in the repo.
         #[arg(long)]
         prune: bool,
+        /// Safe automatic push: no deletion propagation or device configuration
+        #[arg(long, conflicts_with_all = ["prune", "interactive"])]
+        scheduled: bool,
 
         /// Interactive mode - preview changes and confirm before pushing
         #[arg(short, long)]
@@ -317,6 +321,12 @@ enum Commands {
         quiet: bool,
     },
 
+    /// Configure local scheduled safe pushes
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
+    },
+
     /// Manage Claude Code hooks for automatic sync
     Hooks {
         #[command(subcommand)]
@@ -464,7 +474,30 @@ enum HistoryAction {
 }
 
 #[derive(Subcommand)]
+enum ScheduleAction {
+    Set {
+        #[arg(
+            long,
+            conflicts_with = "every_hours",
+            required_unless_present = "every_hours"
+        )]
+        daily: Option<String>,
+        #[arg(long, conflicts_with = "daily", required_unless_present = "daily")]
+        every_hours: Option<String>,
+    },
+    Show,
+    Enable,
+    Disable,
+}
+
+#[derive(Subcommand)]
 enum HooksAction {
+    /// Pause automatic hooks without changing other Claude hooks
+    Disable,
+    /// Resume automatic hooks
+    Enable,
+    /// Show the runtime automatic-hook switch
+    Status,
     /// Install SessionEnd and UserPromptSubmit hooks
     Install,
 
@@ -754,6 +787,16 @@ fn finish_json_aware(result: Result<()>, json: bool) -> Result<()> {
 fn main() -> Result<()> {
     // Parse CLI arguments before initializing logging so logger options are available.
     let cli = Cli::parse();
+    if (matches!(
+        cli.command.as_ref(),
+        Some(
+            Commands::HookStop { .. } | Commands::HookSessionStart | Commands::HookNewProjectCheck
+        )
+    ) || std::env::var_os("CCS_AUTOMATIC_HOOK").is_some())
+        && !handlers::hooks::runtime_hooks_enabled()
+    {
+        return Ok(());
+    }
     let foreground_stop = matches!(
         cli.command.as_ref(),
         Some(Commands::HookStop { worker: false })
@@ -785,6 +828,11 @@ fn main() -> Result<()> {
             | Commands::Report { .. }
             | Commands::History { .. }
             | Commands::Hooks { .. }
+            | Commands::Schedule { .. }
+            | Commands::Push {
+                scheduled: true,
+                ..
+            }
             | Commands::HookStop { .. }
             | Commands::HookSessionStart
             | Commands::HookNewProjectCheck
@@ -810,6 +858,14 @@ fn main() -> Result<()> {
     let is_uninstall_command = matches!(command, Commands::Uninstall { .. });
     let is_unlock_delete_command = matches!(command, Commands::UnlockDelete { .. });
     let is_hooks_command = matches!(command, Commands::Hooks { .. });
+    let is_schedule_command = matches!(command, Commands::Schedule { .. });
+    let is_scheduled_push = matches!(
+        command,
+        Commands::Push {
+            scheduled: true,
+            ..
+        }
+    );
     let is_hook_command = matches!(
         command,
         Commands::HookStop { .. } | Commands::HookSessionStart | Commands::HookNewProjectCheck
@@ -826,6 +882,8 @@ fn main() -> Result<()> {
         && !is_unlock_delete_command
         && !is_hooks_command
         && !is_hook_command
+        && !is_schedule_command
+        && !is_scheduled_push
     {
         log::info!("Running onboarding flow - first time setup detected");
 
@@ -846,6 +904,14 @@ fn main() -> Result<()> {
     }
 
     match command {
+        Commands::Schedule { action } => match action {
+            ScheduleAction::Set { daily, every_hours } => {
+                handlers::schedule::set(daily.as_deref(), every_hours.as_deref())?
+            }
+            ScheduleAction::Show => handlers::schedule::show()?,
+            ScheduleAction::Enable => handlers::schedule::enable()?,
+            ScheduleAction::Disable => handlers::schedule::disable()?,
+        },
         Commands::Init {
             local,
             remote,
@@ -924,6 +990,7 @@ fn main() -> Result<()> {
             exclude_attachments,
             no_config,
             prune,
+            scheduled,
             interactive,
             verbose,
             quiet,
@@ -942,9 +1009,10 @@ fn main() -> Result<()> {
                 push_remote,
                 branch.as_deref(),
                 exclude_attachments,
-                !no_config, // sync_config = !no_config
+                !no_config && !scheduled,
                 interactive,
                 prune,
+                scheduled,
                 verbosity,
             )?;
         }
@@ -1137,6 +1205,9 @@ fn main() -> Result<()> {
             handle_cleanup_snapshots(dry_run, max_count, max_age_days, interactive, verbosity)?;
         }
         Commands::Hooks { action } => match action {
+            HooksAction::Disable => handlers::hooks::handle_hooks_runtime(Some(false))?,
+            HooksAction::Enable => handlers::hooks::handle_hooks_runtime(Some(true))?,
+            HooksAction::Status => handlers::hooks::handle_hooks_runtime(None)?,
             HooksAction::Install => {
                 handle_hooks_install()?;
             }

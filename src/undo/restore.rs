@@ -40,57 +40,55 @@ impl Snapshot {
                 .canonicalize()
                 .context("Failed to canonicalize home directory")?
         };
+        let logical_base = match allowed_base_dir {
+            Some(base) => base.to_path_buf(),
+            None => dirs::home_dir().context("Failed to get home directory")?,
+        };
 
         // Build the complete file state by walking the snapshot chain
         let all_files = self.reconstruct_full_state_with_dir(snapshots_dir)?;
 
-        // First, handle file deletions from the snapshot
-        for deleted_path in &self.deleted_files {
-            let path = PathBuf::from(deleted_path);
-
-            // Validate the path is within allowed directory
-            if let Ok(canonical) = path.canonicalize() {
-                if canonical.starts_with(&allowed_base) && path.exists() {
-                    fs::remove_file(&path)
-                        .with_context(|| format!("Failed to delete file: {}", path.display()))?;
+        // Validate the complete batch before creating, deleting, or writing anything.
+        // Unknown/mapped symlinks stay forbidden for undo in this release.
+        let relative = |path: &Path| -> Result<PathBuf> {
+            let rel = path
+                .strip_prefix(&logical_base)
+                .or_else(|_| path.strip_prefix(&allowed_base))
+                .map_err(|_| anyhow!("restore path is outside allowed root: {}", path.display()))?;
+            crate::path_security::safe_join_within_root(&allowed_base, rel)?;
+            Ok(rel.to_path_buf())
+        };
+        for path in all_files.keys().chain(self.deleted_files.iter()) {
+            let path = Path::new(path);
+            relative(path)?;
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                    return Err(anyhow!(
+                        "restore target is not a regular file: {}",
+                        path.display()
+                    ));
                 }
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error.into())
+                }
+                _ => {}
             }
         }
-
-        // Then restore all files from the reconstructed state
-        for (path_str, content) in &all_files {
-            let path = PathBuf::from(path_str);
-
-            // Canonicalize the path to resolve any symlinks or .. components
-            // First ensure parent directory exists for canonicalization to work
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+        for deleted_path in &self.deleted_files {
+            let rel = relative(Path::new(deleted_path))?;
+            let path = crate::path_security::safe_join_within_root(&allowed_base, &rel)?;
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
-
-            // Create the file if it doesn't exist for canonicalization
-            if !path.exists() {
-                fs::write(&path, b"").with_context(|| {
-                    format!("Failed to create temporary file: {}", path.display())
-                })?;
-            }
-
-            let canonical_path = path
-                .canonicalize()
-                .with_context(|| format!("Failed to canonicalize path: {}", path.display()))?;
-
-            // Validate the canonical path is within the allowed base directory
-            if !canonical_path.starts_with(&allowed_base) {
-                return Err(anyhow!(
-                    "Security: Path traversal detected. Path {} is outside allowed directory {}",
-                    path.display(),
-                    allowed_base.display()
-                ));
-            }
-
-            // Now write the actual content
-            fs::write(&canonical_path, content)
-                .with_context(|| format!("Failed to restore file: {}", canonical_path.display()))?;
+        }
+        for (path, content) in &all_files {
+            let rel = relative(Path::new(path))?;
+            let destination =
+                crate::path_security::prepare_regular_file_destination(&allowed_base, &rel)?;
+            fs::write(&destination, content)
+                .with_context(|| format!("Failed to restore file: {}", destination.display()))?;
         }
 
         Ok(())
@@ -109,5 +107,32 @@ impl Snapshot {
     #[allow(dead_code)]
     pub fn restore(&self) -> Result<()> {
         self.restore_with_base(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_restore_destination_does_not_create_paths_or_delete_valid_files() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = root.path().join("keep.txt");
+        fs::write(&victim, b"keep").unwrap();
+        let forbidden = outside.path().join("must-not-exist/file");
+        let snapshot = Snapshot {
+            snapshot_id: "isolated".into(),
+            timestamp: chrono::Utc::now(),
+            operation_type: crate::history::OperationType::Pull,
+            git_commit_hash: None,
+            files: [(forbidden.to_string_lossy().into_owned(), b"bad".to_vec())].into(),
+            branch: None,
+            base_snapshot_id: None,
+            deleted_files: vec![victim.to_string_lossy().into_owned()],
+        };
+        assert!(snapshot.restore_with_base(Some(root.path())).is_err());
+        assert!(!forbidden.parent().unwrap().exists());
+        assert_eq!(fs::read(victim).unwrap(), b"keep");
     }
 }

@@ -198,7 +198,7 @@ pub fn scan_all_projects() -> Result<Vec<ProjectSummary>> {
     let claude_dir = claude_projects_dir()?;
 
     match fs::symlink_metadata(&claude_dir) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(metadata) if metadata.is_dir() || metadata.file_type().is_symlink() => {}
         Ok(_) => {
             legacy_io_warning("claude", "metadata");
             return Ok(Vec::new());
@@ -213,53 +213,25 @@ pub fn scan_all_projects() -> Result<Vec<ProjectSummary>> {
         }
     }
     if let Err(error) = validate_directory_root(&claude_dir) {
-        legacy_io_warning_from_error("claude", "root", &error);
-        return Ok(Vec::new());
+        let external_root = FilterConfig::load()
+            .ok()
+            .is_some_and(|config| config.external_projects_root.is_some());
+        if !external_root {
+            legacy_io_warning_from_error("claude", "root", &error);
+            return Ok(Vec::new());
+        }
     }
 
     let mut projects = Vec::new();
     // Use a filter with no file size limit for session listing
     let filter = FilterConfig::no_size_limit();
 
-    let entries = match fs::read_dir(&claude_dir) {
-        Ok(entries) => entries,
-        Err(error) => {
-            let error = anyhow::Error::new(error);
-            legacy_io_warning_from_error("claude", "read_dir", &error);
-            return Ok(Vec::new());
-        }
-    };
+    let mapping_config = FilterConfig::load()?;
+    let root_mappings = mapping_config.root_mappings()?;
+    let entries = crate::project_roots::enumerate(&claude_dir, &root_mappings)?;
     for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                let error = anyhow::Error::new(error);
-                legacy_io_warning_from_error("claude", "read_dir", &error);
-                continue;
-            }
-        };
-        let path = entry.path();
-
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                let error = anyhow::Error::new(error);
-                legacy_io_warning_from_error("claude", "project_metadata", &error);
-                continue;
-            }
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            continue;
-        }
-        if let Err(error) = validate_directory_candidate(&claude_dir, &path) {
-            legacy_io_warning_from_error("claude", "project_boundary", &error);
-            continue;
-        }
-
-        let dir_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
+        let path = entry.physical_root;
+        let dir_name = entry.project_dir.as_str();
 
         // Skip hidden directories
         if dir_name.starts_with('.') {
@@ -844,6 +816,7 @@ fn scan_all_session_summaries_with_roots_mode(
             &mut diagnostics,
             &mut scan_fingerprints,
             project_filter,
+            config_dir,
         )?;
         diagnostics.claude_scan_ms = elapsed_millis(scan_started);
     }
@@ -886,7 +859,11 @@ fn scan_all_session_summaries_with_roots_mode(
     wait_for_test_cache_merge_gate()?;
 
     let cache_save_started = Instant::now();
-    let cache_save_result = merge_scan_with_report(config_dir, &delta, &retention);
+    let cache_save_result = if completed_sources.is_empty() && delta.upserts.is_empty() && delta.removals.is_empty() {
+        Ok(crate::session_cache::CacheMergeReport::default())
+    } else {
+        merge_scan_with_report(config_dir, &delta, &retention)
+    };
     diagnostics.cache_save_ms = elapsed_millis(cache_save_started);
     match cache_save_result {
         Ok(report) => {
@@ -1187,6 +1164,7 @@ fn root_is_available(root: &Path, source: &str, diagnostics: &mut ScanDiagnostic
                 true
             }
         }
+        Ok(metadata) if source == "claude" && metadata.file_type().is_symlink() => true,
         Ok(_) => {
             diagnostics.record_warning_with_kind(
                 Some(source),
@@ -1292,6 +1270,7 @@ fn scan_claude_summaries_cached(
     diagnostics: &mut ScanDiagnostics,
     scan_fingerprints: &mut HashMap<PathBuf, String>,
     project_filter: Option<&str>,
+    config_dir: &Path,
 ) -> Result<()> {
     use walkdir::WalkDir;
 
@@ -1304,14 +1283,22 @@ fn scan_claude_summaries_cached(
 
     // A Claude root that cannot be opened is one degraded source, not a fatal
     // scan failure: preserve results from Codex/OMP and any earlier source.
-    let project_entries = match fs::read_dir(root) {
+    let mapping_config = match fs::read_to_string(config_dir.join("config.toml")) {
+        Ok(text) => toml::from_str::<FilterConfig>(&text).map_err(anyhow::Error::from),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FilterConfig::default()),
+        Err(error) => Err(error.into()),
+    };
+    let project_entries = mapping_config.and_then(|config| {
+        let root_mappings = config.root_mappings()?;
+        crate::project_roots::enumerate(root, &root_mappings)
+    });
+    let project_entries = match project_entries {
         Ok(entries) => entries,
         Err(error) => {
             tracker.mark_incomplete("claude");
-            let error = anyhow::Error::new(error);
             diagnostics.record_warning_from_error(
                 Some("claude"),
-                "read_dir",
+                "project_mapping",
                 ScanWarningCategory::Io,
                 Some(root),
                 &error,
@@ -1319,45 +1306,9 @@ fn scan_claude_summaries_cached(
             return Ok(());
         }
     };
-    for dir_entry in project_entries {
-        let dir_entry = match dir_entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                tracker.mark_incomplete("claude");
-                let error = anyhow::Error::new(error);
-                diagnostics.record_warning_from_error(
-                    Some("claude"),
-                    "read_dir",
-                    ScanWarningCategory::Io,
-                    Some(root),
-                    &error,
-                );
-                continue;
-            }
-        };
-        let project_path = dir_entry.path();
-        let file_type = match dir_entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(error) => {
-                tracker.mark_incomplete("claude");
-                let error = anyhow::Error::new(error);
-                diagnostics.record_warning_from_error(
-                    Some("claude"),
-                    "metadata",
-                    ScanWarningCategory::Io,
-                    Some(&project_path),
-                    &error,
-                );
-                continue;
-            }
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        let dir_name = project_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
+    for project in project_entries {
+        let project_path = project.physical_root;
+        let dir_name = project.project_dir.as_str();
         if dir_name.starts_with('.') {
             continue;
         }
@@ -1372,7 +1323,7 @@ fn scan_claude_summaries_cached(
             };
             let file_path = entry.path();
             let Some(candidate) = inspect_candidate_file(
-                root,
+                &project_path,
                 file_path,
                 &filter,
                 "claude",
@@ -5381,10 +5332,11 @@ pub fn handle_session_maintain(
     run: bool,
     source: SessionSourceFilter,
 ) -> Result<()> {
-    let mut config = FilterConfig::load()?;
     if enable || disable {
-        config.session_maintenance.enabled = enable;
-        config.save()?;
+        FilterConfig::update_locked(|config| {
+            config.session_maintenance.enabled = enable;
+            Ok(())
+        })?;
         println!(
             "Session maintenance {}.",
             if enable { "enabled" } else { "disabled" }
@@ -5392,6 +5344,7 @@ pub fn handle_session_maintain(
         return Ok(());
     }
 
+    let config = FilterConfig::load()?;
     if status || (!dry_run && !run) {
         let state = StateStore::from_config_dir(&ConfigManager::config_dir()?).load()?;
         let counts = state.entries.values().fold(
@@ -8842,6 +8795,140 @@ mod tests {
         assert_eq!(second.diagnostics.io_errors, 1);
         // An incomplete source scan preserves the previously valid cache entry.
         assert_eq!(SessionIndexCache::load(&config).entries.len(), 1);
+    }
+
+    #[test]
+    fn missing_mapped_project_preserves_cache_and_marks_claude_incomplete() {
+        let (temp, roots, config) = make_scan_fixture();
+        scan_all_session_summaries_with_roots(None, SessionSourceFilter::Claude, &roots, &config)
+            .unwrap();
+        let before = fs::read(config.join("session_index.json")).unwrap();
+        let mut filter = FilterConfig::default();
+        filter.session_maintenance.enabled = false;
+        filter
+            .project_roots
+            .push(crate::project_roots::ProjectRootMapping {
+                project_dir: "missing-project".into(),
+                target: temp.path().join("missing-volume/projects/missing-project"),
+                trusted_root: temp.path().join("missing-volume/projects"),
+                volume_uuid: "AF9C9871-18AE-40C9-8D18-624E415520C6".into(),
+            });
+        fs::write(
+            config.join("config.toml"),
+            toml::to_string(&filter).unwrap(),
+        )
+        .unwrap();
+        let report = scan_all_session_summaries_with_roots(
+            None,
+            SessionSourceFilter::Claude,
+            &roots,
+            &config,
+        )
+        .unwrap();
+        assert!(report.diagnostics.degraded());
+        assert!(!report.completed_sources.contains(&SessionSource::Claude));
+        assert_eq!(fs::read(config.join("session_index.json")).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_query_uses_hot_cache_and_invalidates_changed_target() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let (temp, roots, config) = make_scan_fixture();
+        let base = temp.path().canonicalize().unwrap();
+        let local = roots.claude_projects.canonicalize().unwrap();
+        let mount = base.join("volume");
+        let trusted = mount.join("projects");
+        let target = trusted.join("project-valid");
+        fs::create_dir_all(&trusted).unwrap();
+        fs::rename(local.join("project-valid"), &target).unwrap();
+        symlink(&target, local.join("project-valid")).unwrap();
+        let mapped_roots = SessionRoots {
+            claude_projects: local.clone(),
+            codex_sessions: roots.codex_sessions,
+            codex_history: roots.codex_history,
+            omp_sessions: roots.omp_sessions,
+        };
+        let mut filter = FilterConfig::default();
+        filter.session_maintenance.enabled = false;
+        filter
+            .project_roots
+            .push(crate::project_roots::ProjectRootMapping {
+                project_dir: "project-valid".into(),
+                target: target.clone(),
+                trusted_root: trusted,
+                volume_uuid: "AF9C9871-18AE-40C9-8D18-624E415520C6".into(),
+            });
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("config.toml"),
+            toml::to_string(&filter).unwrap(),
+        )
+        .unwrap();
+        let volume = crate::project_roots::VolumeIdentity {
+            mount_point: mount.clone(),
+            volume_uuid: filter.project_roots[0].volume_uuid.clone(),
+            device_id: fs::metadata(&mount).unwrap().dev(),
+        };
+        crate::project_roots::with_test_volume(volume, || {
+            let cold = scan_all_session_summaries_with_roots(
+                None,
+                SessionSourceFilter::Claude,
+                &mapped_roots,
+                &config,
+            )
+            .unwrap();
+            assert!(cold
+                .summaries
+                .iter()
+                .any(|s| s.file_path.starts_with(&target)));
+            let hot = scan_all_session_summaries_with_roots(
+                None,
+                SessionSourceFilter::Claude,
+                &mapped_roots,
+                &config,
+            )
+            .unwrap();
+            assert_eq!(hot.diagnostics.cache_hits, 1);
+            let new_trusted = mount.join("changed");
+            fs::create_dir(&new_trusted).unwrap();
+            let new_target = new_trusted.join("project-valid");
+            fs::rename(&target, &new_target).unwrap();
+            fs::remove_file(local.join("project-valid")).unwrap();
+            symlink(&new_target, local.join("project-valid")).unwrap();
+            filter.project_roots[0].target = new_target.clone();
+            filter.project_roots[0].trusted_root = new_trusted;
+            fs::write(
+                config.join("config.toml"),
+                toml::to_string(&filter).unwrap(),
+            )
+            .unwrap();
+            let changed = scan_all_session_summaries_with_roots(
+                None,
+                SessionSourceFilter::Claude,
+                &mapped_roots,
+                &config,
+            )
+            .unwrap();
+            assert_eq!(changed.diagnostics.cache_hits, 0);
+            assert!(changed
+                .summaries
+                .iter()
+                .any(|s| s.file_path.starts_with(new_target.clone())));
+            let before = fs::read(config.join("session_index.json")).unwrap();
+            let child = new_target.join("-nested");
+            fs::create_dir(&child).unwrap();
+            symlink(&child, local.join("-nested")).unwrap();
+            filter.project_roots.push(crate::project_roots::ProjectRootMapping {
+                project_dir: "-nested".into(), target: child, trusted_root: new_target,
+                volume_uuid: filter.project_roots[0].volume_uuid.clone(),
+            });
+            fs::write(config.join("config.toml"), toml::to_string(&filter).unwrap()).unwrap();
+            let rejected = scan_all_session_summaries_with_roots(None, SessionSourceFilter::Claude, &mapped_roots, &config).unwrap();
+            assert!(rejected.diagnostics.degraded());
+            assert!(!rejected.completed_sources.contains(&SessionSource::Claude));
+            assert_eq!(fs::read(config.join("session_index.json")).unwrap(), before);
+        });
     }
 
     #[test]

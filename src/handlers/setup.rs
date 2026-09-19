@@ -845,7 +845,22 @@ pub fn handle_setup(skip_sync: bool) -> Result<()> {
             .unwrap_or(true);
     }
 
-    filter_config.save().context("保存配置失败")?;
+    let selected_use_project_name_only = filter_config.use_project_name_only;
+    let selected_sync_subdirectory = filter_config.sync_subdirectory.clone();
+    let selected_exclude_attachments = filter_config.exclude_attachments;
+    let selected_exclude_older_than_days = filter_config.exclude_older_than_days;
+    let selected_config_sync = filter_config.config_sync.clone();
+    FilterConfig::update_locked(|current| {
+        // Apply only fields managed by this wizard. Root authorizations and
+        // all other fields are reloaded under the lock and preserved.
+        current.use_project_name_only = selected_use_project_name_only;
+        current.sync_subdirectory = selected_sync_subdirectory;
+        current.exclude_attachments = selected_exclude_attachments;
+        current.exclude_older_than_days = selected_exclude_older_than_days;
+        current.config_sync = selected_config_sync;
+        Ok(())
+    })
+    .context("保存配置失败")?;
     println!("{}", "✓ 配置已保存".green());
 
     println!();

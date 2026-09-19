@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::conflict::{Conflict, ConflictResolution};
 use crate::parser::ConversationSession;
+use crate::project_roots::{file_boundary, ProjectRootMapping};
 use crate::sync::session_write::{
     append_merged_entries_guarded, write_new_session_noclobber, AppendSessionWriteOutcome,
     NewSessionWriteOutcome, SessionBaseline,
@@ -377,6 +378,7 @@ fn write_conflict_copy_noclobber(
     conflict: &Conflict,
     remote_session: &ConversationSession,
     claude_dir: &Path,
+    mappings: &[ProjectRootMapping],
 ) -> Result<(PathBuf, crate::sync::session_write::CommitDurability)> {
     let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
     for attempt in 0..1000usize {
@@ -387,9 +389,10 @@ fn write_conflict_copy_noclobber(
         };
         let renamed_path = conflict.clone().resolve_keep_both(&suffix)?;
         let relative = relative_local_path(claude_dir, &renamed_path)?;
-        match write_new_session_noclobber(remote_session, claude_dir, relative)? {
-            NewSessionWriteOutcome::Written { path, durability } => {
-                return Ok((path, durability));
+        let (write_root, write_relative) = file_boundary(claude_dir, mappings, relative)?;
+        match write_new_session_noclobber(remote_session, &write_root, &write_relative)? {
+            NewSessionWriteOutcome::Written { durability, .. } => {
+                return Ok((renamed_path, durability));
             }
             NewSessionWriteOutcome::SkippedExisting(_) => continue,
         }
@@ -401,14 +404,15 @@ fn write_conflict_copy_noclobber(
 }
 
 /// Apply resolutions using snapshot-derived local baselines. Existing files are
-/// replaced only if they still match the exact bytes observed before the user
-/// made a resolution choice.
+/// only extended through the guarded append writer; unsafe merges become separate
+/// no-clobber copies. Mapping authorization is rechecked before every write.
 pub(crate) fn apply_resolutions_guarded(
     result: &ResolutionResult,
     remote_sessions: &[ConversationSession],
     claude_dir: &Path,
     _remote_projects_dir: &Path,
     baselines: &HashMap<String, SessionBaseline>,
+    mappings: &[ProjectRootMapping],
 ) -> Result<GuardedApplyResult> {
     let mut applied = GuardedApplyResult::default();
 
@@ -430,9 +434,10 @@ pub(crate) fn apply_resolutions_guarded(
                 file_path: conflict.local_file.to_string_lossy().to_string(),
             };
             let relative = relative_local_path(claude_dir, &conflict.local_file)?;
+            let (write_root, write_relative) = file_boundary(claude_dir, mappings, relative)?;
             match append_merged_entries_guarded(
-                claude_dir,
-                relative,
+                &write_root,
+                &write_relative,
                 baseline,
                 &merged_session.entries,
             ) {
@@ -463,8 +468,12 @@ pub(crate) fn apply_resolutions_guarded(
                                 conflict.session_id
                             )
                         })?;
-                    let (path, durability) =
-                        write_conflict_copy_noclobber(conflict, remote_session, claude_dir)?;
+                    let (path, durability) = write_conflict_copy_noclobber(
+                        conflict,
+                        remote_session,
+                        claude_dir,
+                        mappings,
+                    )?;
                     applied
                         .renames
                         .push((conflict.remote_file.clone(), path.clone()));
@@ -488,7 +497,7 @@ pub(crate) fn apply_resolutions_guarded(
                 )
             })?;
         let (path, durability) =
-            write_conflict_copy_noclobber(conflict, remote_session, claude_dir)?;
+            write_conflict_copy_noclobber(conflict, remote_session, claude_dir, mappings)?;
         applied
             .renames
             .push((conflict.remote_file.clone(), path.clone()));
@@ -509,7 +518,7 @@ pub(crate) fn apply_resolutions_guarded(
                 )
             })?;
         let (renamed_path, durability) =
-            write_conflict_copy_noclobber(conflict, remote_session, claude_dir)?;
+            write_conflict_copy_noclobber(conflict, remote_session, claude_dir, mappings)?;
         applied
             .renames
             .push((conflict.remote_file.clone(), renamed_path.clone()));
@@ -588,6 +597,7 @@ pub fn apply_resolutions(
         claude_dir,
         remote_projects_dir,
         &baselines,
+        &[],
     )?;
     let outcome_for = |session_id: &str| {
         applied
@@ -766,6 +776,132 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn keep_both_rejects_unregistered_project_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("projects");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("session.jsonl"), b"local\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("project")).unwrap();
+        let remote = test_session(&temp.path().join("remote/session.jsonl"), "remote");
+        let mut result = ResolutionResult::new();
+        result.keep_both.push(test_conflict(
+            root.join("project/session.jsonl"),
+            PathBuf::from(&remote.file_path),
+        ));
+
+        assert!(apply_resolutions_guarded(
+            &result,
+            &[remote],
+            &root,
+            temp.path(),
+            &HashMap::new(),
+            &[],
+        )
+        .is_err());
+        assert_eq!(fs::read(outside.join("session.jsonl")).unwrap(), b"local\n");
+        let names: Vec<_> = fs::read_dir(&outside)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("session.jsonl")]);
+    }
+
+    #[test]
+    fn keep_both_rechecks_unrelated_mapping_before_creating_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let local_file = root.path().join("project/session.jsonl");
+        std::fs::create_dir_all(local_file.parent().unwrap()).unwrap();
+        std::fs::write(&local_file, b"local\n").unwrap();
+        let remote = test_session(&root.path().join("remote/session.jsonl"), "remote");
+        let mut result = ResolutionResult::new();
+        result.keep_both.push(test_conflict(
+            local_file.clone(),
+            PathBuf::from(&remote.file_path),
+        ));
+        let mappings = [ProjectRootMapping {
+            project_dir: "missing-project".to_string(),
+            target: root.path().join("missing-volume/missing-project"),
+            trusted_root: root.path().join("missing-volume"),
+            volume_uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+        }];
+
+        assert!(apply_resolutions_guarded(
+            &result,
+            &[remote],
+            root.path(),
+            root.path(),
+            &HashMap::new(),
+            &mappings,
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&local_file).unwrap(), b"local\n");
+        let names: Vec<_> = std::fs::read_dir(local_file.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("session.jsonl")]);
+        assert!(!root.path().join("missing-volume").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_smart_merge_appends_without_replacing_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let local_file = root.path().join("project/session.jsonl");
+        fs::create_dir_all(local_file.parent().unwrap()).unwrap();
+        let original = b"{\"type\":\"user\",\"uuid\":\"local\",\"sessionId\":\"session\"}\n";
+        fs::write(&local_file, original).unwrap();
+        let inode = fs::metadata(&local_file).unwrap().ino();
+        let baselines = HashMap::from([(
+            "session".to_string(),
+            SessionBaseline::from_snapshot(&local_file, "session", original.to_vec()).unwrap(),
+        )]);
+        let remote = test_session(&root.path().join("remote/session.jsonl"), "remote");
+        let mut merged_entries = test_session(&local_file, "local").entries;
+        merged_entries.extend(remote.entries.clone());
+        let mut conflict = test_conflict(local_file.clone(), PathBuf::from(&remote.file_path));
+        conflict.resolution = ConflictResolution::SmartMerge {
+            merged_entries,
+            stats: crate::merge::MergeStats::default(),
+        };
+        let mut result = ResolutionResult::new();
+        result.smart_merge.push(conflict);
+
+        let applied = apply_resolutions_guarded(
+            &result,
+            &[remote],
+            root.path(),
+            root.path(),
+            &baselines,
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            applied.outcomes[0].1,
+            GuardedApplyOutcome::Written {
+                entries_added: 1,
+                ..
+            }
+        ));
+        assert!(fs::read(&local_file).unwrap().starts_with(original));
+        assert_eq!(fs::metadata(&local_file).unwrap().ino(), inode);
+        let session = ConversationSession::from_file(&local_file).unwrap();
+        assert_eq!(
+            session
+                .entries
+                .iter()
+                .filter_map(|entry| entry.uuid.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["local", "remote"]
+        );
+    }
+
     #[test]
     fn compatibility_apply_resolutions_errors_when_baseline_cannot_be_read() {
         let root = tempfile::tempdir().unwrap();
@@ -847,9 +983,15 @@ mod tests {
         )]);
         std::fs::write(&local_file, b"changed while waiting\n").unwrap();
 
-        let applied =
-            apply_resolutions_guarded(&result, &[remote], root.path(), root.path(), &baselines)
-                .unwrap();
+        let applied = apply_resolutions_guarded(
+            &result,
+            &[remote],
+            root.path(),
+            root.path(),
+            &baselines,
+            &[],
+        )
+        .unwrap();
 
         assert!(matches!(
             applied.outcomes[0].1,
@@ -889,9 +1031,15 @@ mod tests {
         std::fs::write(&local_file, b"changed while waiting\n").unwrap();
 
         let remote = test_session(&root.path().join("remote/session.jsonl"), "remote");
-        let applied =
-            apply_resolutions_guarded(&result, &[remote], root.path(), root.path(), &baselines)
-                .unwrap();
+        let applied = apply_resolutions_guarded(
+            &result,
+            &[remote],
+            root.path(),
+            root.path(),
+            &baselines,
+            &[],
+        )
+        .unwrap();
 
         assert!(matches!(
             applied.outcomes[0].1,
@@ -920,6 +1068,7 @@ mod tests {
             root.path(),
             root.path(),
             &std::collections::HashMap::new(),
+            &[],
         )
         .unwrap();
         let second = apply_resolutions_guarded(
@@ -928,6 +1077,7 @@ mod tests {
             root.path(),
             root.path(),
             &std::collections::HashMap::new(),
+            &[],
         )
         .unwrap();
 
@@ -959,9 +1109,15 @@ mod tests {
             .unwrap(),
         )]);
 
-        let applied =
-            apply_resolutions_guarded(&result, &[remote], root.path(), root.path(), &baselines)
-                .unwrap();
+        let applied = apply_resolutions_guarded(
+            &result,
+            &[remote],
+            root.path(),
+            root.path(),
+            &baselines,
+            &[],
+        )
+        .unwrap();
 
         assert!(matches!(
             applied.outcomes[0].1,
@@ -970,6 +1126,68 @@ mod tests {
         assert_eq!(std::fs::read(&local_file).unwrap(), local);
         assert!(applied.renames[0].1.is_file());
     }
+    #[cfg(unix)]
+    #[test]
+    fn mapped_keep_both_writes_external_copy_but_tracks_logical_path() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let local = base.join("local");
+        let mount = base.join("volume");
+        let trusted = mount.join("projects");
+        let target = trusted.join("project");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir(&local).unwrap();
+        symlink(&target, local.join("project")).unwrap();
+        let original = b"original local bytes";
+        std::fs::write(target.join("session.jsonl"), original).unwrap();
+        let inode = std::fs::metadata(target.join("session.jsonl"))
+            .unwrap()
+            .ino();
+        let mapping = crate::project_roots::ProjectRootMapping {
+            project_dir: "project".into(),
+            target: target.clone(),
+            trusted_root: trusted,
+            volume_uuid: "AF9C9871-18AE-40C9-8D18-624E415520C6".into(),
+        };
+        let volume = crate::project_roots::VolumeIdentity {
+            mount_point: mount.clone(),
+            volume_uuid: mapping.volume_uuid.clone(),
+            device_id: std::fs::metadata(&mount).unwrap().dev(),
+        };
+        crate::project_roots::with_test_volume(volume, || {
+            let mut result = ResolutionResult::new();
+            let remote_path = base.join("remote/session.jsonl");
+            result.keep_both.push(test_conflict(
+                local.join("project/session.jsonl"),
+                remote_path.clone(),
+            ));
+            let remote = test_session(&remote_path, "remote");
+            let applied = apply_resolutions_guarded(
+                &result,
+                &[remote],
+                &local,
+                &base.join("remote"),
+                &HashMap::new(),
+                &[mapping],
+            )
+            .unwrap();
+            let logical_copy = &applied.renames[0].1;
+            assert!(logical_copy.starts_with(local.join("project")));
+            assert!(target.join(logical_copy.file_name().unwrap()).is_file());
+            assert_eq!(
+                std::fs::read(target.join("session.jsonl")).unwrap(),
+                original
+            );
+            assert_eq!(
+                std::fs::metadata(target.join("session.jsonl"))
+                    .unwrap()
+                    .ino(),
+                inode
+            );
+        });
+    }
+
     #[test]
     fn reported_resolution_reflects_actual_keep_both_and_skips() {
         let root = tempfile::tempdir().unwrap();
@@ -1025,9 +1243,15 @@ mod tests {
             .push(test_conflict(local_file.clone(), remote_file));
         let baselines = std::collections::HashMap::from([("session".to_string(), baseline)]);
 
-        let applied =
-            apply_resolutions_guarded(&result, &[remote], root.path(), root.path(), &baselines)
-                .unwrap();
+        let applied = apply_resolutions_guarded(
+            &result,
+            &[remote],
+            root.path(),
+            root.path(),
+            &baselines,
+            &[],
+        )
+        .unwrap();
 
         assert!(local_file.is_dir());
         assert_eq!(applied.renames.len(), 1);

@@ -78,6 +78,72 @@ pub(crate) fn discover_sessions(
     Ok(session_map.into_values().collect())
 }
 
+/// Claude-only discovery: mappings never authorize paths in the sync repository.
+pub(crate) fn discover_local_sessions(
+    base_path: &Path,
+    filter: &FilterConfig,
+    strict: bool,
+) -> Result<Vec<ConversationSession>> {
+    let root_mappings = filter.root_mappings()?;
+    let roots = crate::project_roots::enumerate(base_path, &root_mappings)?;
+    discover_local_sessions_in_roots(&roots, filter, strict)
+}
+
+pub(crate) fn discover_local_sessions_in_roots(
+    roots: &[crate::project_roots::ResolvedProjectRoot],
+    filter: &FilterConfig,
+    strict: bool,
+) -> Result<Vec<ConversationSession>> {
+    let mut sessions = HashMap::<String, ConversationSession>::new();
+    for root in roots {
+        for entry in WalkDir::new(&root.physical_root).follow_links(false) {
+            let entry = entry.context("failed to enumerate local session snapshot")?;
+            if !entry.file_type().is_file()
+                || entry.path().extension().and_then(|s| s.to_str()) != Some("jsonl")
+            {
+                continue;
+            }
+            validate_regular_candidate(&root.physical_root, entry.path())?;
+            let relative = entry.path().strip_prefix(&root.physical_root)?;
+            let logical = root.logical_root.join(relative);
+            if !filter.should_include(&logical) {
+                continue;
+            }
+            super::push_diagnostics::candidate();
+            let snapshot_started = std::time::Instant::now();
+            let parsed = if strict {
+                ConversationSession::from_stable_snapshot(entry.path())
+            } else {
+                ConversationSession::from_file(entry.path())
+            };
+            if strict {
+                super::push_diagnostics::snapshot(entry.metadata().map(|metadata| metadata.len()).unwrap_or(0), snapshot_started.elapsed());
+            }
+            let mut session = match parsed {
+                Ok(session) => session,
+                Err(error) if strict => return Err(error),
+                Err(_) => continue,
+            };
+            super::push_diagnostics::parsed();
+            // Logical identity is stable across disk moves; consumers resolve before I/O.
+            session.file_path = logical.to_string_lossy().into_owned();
+            let canonical = |s: &ConversationSession| {
+                Path::new(&s.file_path).file_stem().and_then(|s| s.to_str())
+                    == Some(s.session_id.as_str())
+            };
+            let replace = sessions.get(&session.session_id).map_or(true, |old| {
+                (canonical(&session) && !canonical(old))
+                    || (canonical(&session) == canonical(old)
+                        && session.message_count() > old.message_count())
+            });
+            if replace {
+                sessions.insert(session.session_id.clone(), session);
+            }
+        }
+    }
+    Ok(sessions.into_values().collect())
+}
+
 /// Walk `base_path` and return the validated `.jsonl` candidates, applying the
 /// same filter and path-security checks as `discover_sessions`.
 fn collect_session_candidates(base_path: &Path, filter: &FilterConfig) -> Vec<PathBuf> {
@@ -123,6 +189,52 @@ pub(crate) fn count_unique_sessions(base_path: &Path, filter: &FilterConfig) -> 
             }
             Err(_) => {
                 log::warn!(target: crate::logger::SCAN_DIAGNOSTICS_TARGET, "session count skipped an unreadable file");
+            }
+        }
+    }
+    Ok(ids.len())
+}
+
+/// Count sessions across already-authorized Claude project roots.
+///
+/// The physical roots are supplied by the root resolver so an external whole
+/// root never gets treated as a logical symlink directory. Returned identities
+/// still follow the logical project path used by callers.
+pub(crate) fn count_unique_sessions_in_roots(
+    roots: &[crate::project_roots::ResolvedProjectRoot],
+    filter: &FilterConfig,
+) -> Result<usize> {
+    let mut ids = std::collections::HashSet::new();
+    for root in roots {
+        for entry in WalkDir::new(&root.physical_root).follow_links(false) {
+            let Some(entry) = legacy_walk_entry(entry, "claude") else {
+                continue;
+            };
+            let path = entry.path();
+            // Claude creates symlinked subagent transcripts for forked sessions;
+            // skip non-regular entries like the discovery walk instead of failing.
+            if !entry.file_type().is_file()
+                || path.extension().and_then(|s| s.to_str()) != Some("jsonl")
+            {
+                continue;
+            }
+            validate_regular_candidate(&root.physical_root, path)?;
+            let relative = path.strip_prefix(&root.physical_root)?;
+            if !filter.should_include(&root.logical_root.join(relative)) {
+                continue;
+            }
+            match crate::parser::first_entry_value(path, |entry| entry.session_id.clone()) {
+                Ok(Some(id)) => {
+                    ids.insert(id);
+                }
+                Ok(None) => {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        ids.insert(stem.to_string());
+                    }
+                }
+                Err(_) => {
+                    log::warn!(target: crate::logger::SCAN_DIAGNOSTICS_TARGET, "session count skipped an unreadable file");
+                }
             }
         }
     }
@@ -190,9 +302,8 @@ pub fn extract_project_name(encoded_path: &str) -> &str {
 /// Find a local Claude project directory that matches the given project name.
 ///
 /// Scans `~/.claude/projects/` for directories that match the specified project name.
-/// Uses two strategies and merges results:
-/// 1. Fast: extract project name from encoded directory name (unreliable for hyphenated names)
-/// 2. Precise: read JSONL files and extract project name from `cwd` field
+/// Prefer the project name from JSONL `cwd`; use the encoded directory name
+/// only when no parseable cwd is available.
 ///
 /// # Returns
 /// - `Some(PathBuf)` if exactly one matching project directory is found
@@ -214,42 +325,20 @@ pub fn find_local_project_by_name(
         })
         .collect();
 
-    // Pass 1 (fast): match by encoded directory name.
-    // Skip directories whose name ends with '-' : Claude Code encodes each
-    // non-ASCII char (e.g. Chinese) as a single '-', so a dir like
-    // "-Users-mini-Documents-Projects-----" (cwd .../Projects/安装环境) ends with
-    // dashes and extract_project_name() would misread the PARENT segment
-    // ("Projects") as the project name, causing a false collision with a real
-    // sibling of that name. Such dirs are left to the precise Pass 2 (cwd).
-    let matches_from_dir: Vec<PathBuf> = entries
-        .iter()
-        .filter(|e| {
-            e.file_name().to_str().is_some_and(|name| {
-                !name.ends_with('-') && extract_project_name(name) == project_name
-            })
+    let all_matches: Vec<PathBuf> = entries
+        .into_iter()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let matches = match get_project_name_from_dir(&path) {
+                Some(real_name) => real_name == project_name,
+                None => entry.file_name().to_str().is_some_and(|name| {
+                    // Trailing dashes encode non-ASCII names, not the parent name.
+                    !name.ends_with('-') && extract_project_name(name) == project_name
+                }),
+            };
+            matches.then_some(path)
         })
-        .map(|e| e.path())
         .collect();
-
-    // Pass 2 (precise): read JSONL cwd to get real project name
-    // Always run - extract_project_name is unreliable for hyphenated names
-    let mut matches_from_cwd: Vec<PathBuf> = Vec::new();
-    for entry in &entries {
-        let dir_path = entry.path();
-        if let Some(real_name) = get_project_name_from_dir(&dir_path) {
-            if real_name == project_name {
-                matches_from_cwd.push(dir_path);
-            }
-        }
-    }
-
-    // Merge: cwd matches are authoritative, supplement with dir-name matches
-    let mut all_matches = matches_from_cwd;
-    for path in matches_from_dir {
-        if !all_matches.contains(&path) {
-            all_matches.push(path);
-        }
-    }
 
     match all_matches.len() {
         1 => Some(all_matches.into_iter().next().unwrap()),
@@ -264,6 +353,29 @@ pub fn find_local_project_by_name(
         }
         _ => None,
     }
+}
+
+pub(crate) fn find_mapped_local_project_by_name(
+    projects: &Path,
+    mappings: &[crate::project_roots::ProjectRootMapping],
+    name: &str,
+) -> Result<Option<PathBuf>> {
+    let mut matched = None;
+    for root in crate::project_roots::enumerate(projects, mappings)? {
+        let matches = match get_project_name_from_dir(&root.physical_root) {
+            Some(cwd_name) => cwd_name == name,
+            None => {
+                !root.project_dir.ends_with('-') && extract_project_name(&root.project_dir) == name
+            }
+        };
+        if matches {
+            if matched.is_some() {
+                return Ok(None);
+            }
+            matched = Some(root.logical_root);
+        }
+    }
+    Ok(matched)
 }
 
 /// Extract the real project name from a local project directory by reading its JSONL files.
@@ -736,6 +848,29 @@ mod tests {
         let result = find_local_project_by_name(projects_dir, "ux-workspace");
         assert!(result.is_some(), "Should match via JSONL cwd");
         assert!(result.unwrap().ends_with("-Users-abc-ux-workspace"));
+    }
+
+    #[test]
+    fn test_find_local_project_cwd_overrides_suffix_guess() {
+        let temp = tempdir().unwrap();
+        let creator = temp.path().join("-Volumes-Data-Projects-creator");
+        let skill = temp.path().join("-plugins-skill-creator");
+        fs::create_dir(&creator).unwrap();
+        fs::create_dir(&skill).unwrap();
+        create_session_with_cwd(
+            &creator,
+            "creator-session",
+            "/Volumes/Data/Projects/creator",
+        );
+        create_session_with_cwd(&skill, "skill-session", "/plugins/skill-creator");
+        assert_eq!(
+            find_local_project_by_name(temp.path(), "creator"),
+            Some(creator)
+        );
+        assert_eq!(
+            find_local_project_by_name(temp.path(), "skill-creator"),
+            Some(skill)
+        );
     }
 
     #[test]

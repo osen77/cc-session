@@ -327,6 +327,31 @@ pub(crate) fn run_maintenance(
         report.visibility = visibility_from_state(&state);
         return Ok(report);
     }
+    let mapping_config = match fs::read_to_string(input.config_dir.join("config.toml")) {
+        Ok(text) => toml::from_str::<crate::filter::FilterConfig>(&text)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::filter::FilterConfig::default()
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let external_root_configured = mapping_config.external_projects_root.is_some();
+    let mapped_summary = |summary: &SessionSummary| {
+        summary.source == "claude"
+            && (external_root_configured
+                || mapping_config.project_roots.iter().any(|mapping| {
+                    summary.file_path.starts_with(&mapping.target)
+                        || summary
+                            .file_path
+                            .starts_with(input.roots.claude.join(&mapping.project_dir))
+                }))
+    };
+    let mapped_relative = |path: &Path| {
+        external_root_configured
+            || mapping_config
+                .project_roots
+                .iter()
+                .any(|mapping| path.starts_with(&mapping.project_dir))
+    };
     report.visibility = visibility_from_state(&state);
     let Some(policy) = maintenance_policy(input.settings) else {
         report.warnings = 1;
@@ -338,6 +363,9 @@ pub(crate) fn run_maintenance(
     let mut grouped: HashMap<SessionIdentity, Vec<&SessionSummary>> = HashMap::new();
     let mut validation_failed = false;
     for summary in input.summaries {
+        if mapped_summary(summary) {
+            continue;
+        }
         let Ok(identity) = summary.identity() else {
             validation_failed = true;
             continue;
@@ -395,7 +423,10 @@ pub(crate) fn run_maintenance(
     // remain entirely read-only, so it intentionally skips reconciliation.
     if mode == MaintenanceMode::Apply {
         if let Some(pending) = state.pending.as_ref() {
-            if input.completed_sources.contains(&pending.identity.source) {
+            if input.completed_sources.contains(&pending.identity.source)
+                && !(pending.identity.source == SessionSource::Claude
+                    && mapped_relative(&pending.source_relative_path))
+            {
                 if let Err(error) = reconcile_pending(&store, input.roots, input.clock.now()) {
                     report.warnings += 1;
                     state = store

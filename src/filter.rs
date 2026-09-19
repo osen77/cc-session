@@ -266,6 +266,16 @@ fn get_friendly_computer_name() -> Option<String> {
 /// Filter configuration for syncing Claude Code history
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilterConfig {
+    /// Exact local-only bindings for external Claude project storage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_roots: Vec<crate::project_roots::ProjectRootMapping>,
+
+    /// Local-only authorization for a single external Claude projects root.
+    /// This is mutually exclusive with `project_roots` and is never part of
+    /// device configuration synchronization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_projects_root: Option<crate::project_roots::ExternalProjectsRoot>,
+
     /// Exclude projects older than N days
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exclude_older_than_days: Option<u32>,
@@ -353,6 +363,8 @@ fn default_use_project_name_only() -> bool {
 impl Default for FilterConfig {
     fn default() -> Self {
         FilterConfig {
+            project_roots: Vec::new(),
+            external_projects_root: None,
             exclude_older_than_days: None,
             include_patterns: Vec::new(),
             exclude_patterns: Vec::new(),
@@ -400,22 +412,43 @@ impl FilterConfig {
         Ok(config)
     }
 
-    /// Save configuration to file
+    /// Save configuration to file atomically under the configuration lock.
     pub fn save(&self) -> Result<()> {
         let config_path = Self::config_path()?;
+        let lock_path = config_path.with_file_name("config.toml.lock");
+        let _lock = crate::atomic_file::FileLock::acquire(&lock_path)
+            .with_context(|| format!("Failed to lock config file: {}", config_path.display()))?;
+        self.save_locked(&config_path)
+    }
 
-        if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create config directory: {}", parent.display())
-            })?;
-        }
-
+    fn save_locked(&self, config_path: &Path) -> Result<()> {
         let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
-
-        fs::write(&config_path, content)
+        crate::atomic_file::persist_bytes_atomic(config_path, content.as_bytes())
             .with_context(|| format!("Failed to write config file: {}", config_path.display()))?;
-
         Ok(())
+    }
+
+    /// Reload, modify and atomically save configuration while holding one lock.
+    ///
+    /// Callers collect interactive input before entering this method. The
+    /// closure therefore runs without human-facing prompts while the lock is
+    /// held, and stale callers cannot overwrite root authorizations or fields
+    /// they do not manage.
+    pub fn update_locked(update: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        let config_path = Self::config_path()?;
+        let lock_path = config_path.with_file_name("config.toml.lock");
+        let _lock = crate::atomic_file::FileLock::acquire(&lock_path)
+            .with_context(|| format!("Failed to lock config file: {}", config_path.display()))?;
+        let mut config = if config_path.exists() {
+            let content = fs::read_to_string(&config_path)
+                .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
+            toml::from_str(&content).context("Failed to parse config file")?
+        } else {
+            Self::default()
+        };
+        update(&mut config)?;
+        config.validate()?;
+        config.save_locked(&config_path)
     }
 
     /// Get the path to the config file
@@ -505,10 +538,35 @@ impl FilterConfig {
         }
     }
 
+    /// Return the root authorizations consumed by Claude storage readers.
+    ///
+    /// The external whole-root form is represented internally as one scoped
+    /// mapping so existing root-aware consumers share the same validation and
+    /// mutation guard. It is never serialized into the legacy array.
+    pub fn root_mappings(&self) -> Result<Vec<crate::project_roots::ProjectRootMapping>> {
+        if self.external_projects_root.is_some() && !self.project_roots.is_empty() {
+            bail!("external_projects_root is mutually exclusive with project_roots");
+        }
+        if self
+            .project_roots
+            .iter()
+            .any(|mapping| mapping.project_dir == crate::project_roots::EXTERNAL_ROOT_PROJECT_DIR)
+        {
+            bail!("reserved external root mapping cannot appear in project_roots");
+        }
+        Ok(self
+            .external_projects_root
+            .as_ref()
+            .map(|root| vec![root.as_mapping()])
+            .unwrap_or_else(|| self.project_roots.clone()))
+    }
+
     /// Validate the configuration.
     ///
-    /// Returns an error if LFS is enabled with a non-git backend.
+    /// Returns an error if LFS is enabled with a non-git backend or if the two
+    /// mutually-exclusive external-root modes are mixed.
     pub fn validate(&self) -> Result<()> {
+        let _ = self.root_mappings()?;
         if self.enable_lfs && self.scm_backend.to_lowercase() != "git" {
             bail!(
                 "Git LFS is only supported with the 'git' backend. \
@@ -567,7 +625,17 @@ pub fn update_config(
     sync_subdirectory: Option<String>,
     use_project_name_only: Option<bool>,
 ) -> Result<()> {
-    let mut config = FilterConfig::load()?;
+    let config_path = FilterConfig::config_path()?;
+    let lock_path = config_path.with_file_name("config.toml.lock");
+    let _lock = crate::atomic_file::FileLock::acquire(&lock_path)
+        .with_context(|| format!("Failed to lock config file: {}", config_path.display()))?;
+    let mut config = if config_path.exists() {
+        let content = fs::read_to_string(&config_path)
+            .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
+        toml::from_str(&content).context("Failed to parse config file")?
+    } else {
+        FilterConfig::default()
+    };
 
     if let Some(days) = exclude_older_than {
         config.exclude_older_than_days = Some(days);
@@ -723,7 +791,7 @@ pub fn update_config(
     // Validate configuration before saving
     config.validate()?;
 
-    config.save()?;
+    config.save_locked(&config_path)?;
     println!("{}", "Configuration saved successfully!".green().bold());
 
     Ok(())
@@ -948,6 +1016,42 @@ new_project_check = false
             round_tripped.config_sync.device_name.as_deref(),
             Some("test-device")
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn locked_update_preserves_latest_root_authorization_and_applies_wizard_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os(crate::config::CONFIG_DIR_ENV);
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, temp.path());
+        let restore = || match previous {
+            Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+            None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+        };
+
+        let target = temp.path().join("volume/projects/current");
+        let trusted_root = temp.path().join("volume/projects");
+        let mut latest = FilterConfig::default();
+        latest.project_roots.push(crate::project_roots::ProjectRootMapping {
+            project_dir: "current".into(),
+            target: target.clone(),
+            trusted_root,
+            volume_uuid: "AF9C9871-18AE-40C9-8D18-624E415520C6".into(),
+        });
+        latest.save().unwrap();
+
+        FilterConfig::update_locked(|config| {
+            config.use_project_name_only = false;
+            config.exclude_attachments = true;
+            Ok(())
+        })
+        .unwrap();
+
+        let loaded = FilterConfig::load().unwrap();
+        assert_eq!(loaded.project_roots[0].target, target);
+        assert!(!loaded.use_project_name_only);
+        assert!(loaded.exclude_attachments);
+        restore();
     }
 
     #[test]

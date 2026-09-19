@@ -142,6 +142,25 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
+    struct ConfigEnvGuard(Option<std::ffi::OsString>);
+
+    impl ConfigEnvGuard {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os(crate::config::CONFIG_DIR_ENV);
+            std::env::set_var(crate::config::CONFIG_DIR_ENV, path);
+            Self(previous)
+        }
+    }
+
+    impl Drop for ConfigEnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+            }
+        }
+    }
+
     /// The process-wide flag is global state; tests that touch it must not run
     /// concurrently with each other.
     fn reset_flag() {
@@ -153,7 +172,7 @@ mod tests {
     fn nested_acquisition_does_not_deadlock() {
         reset_flag();
         let dir = tempdir().unwrap();
-        std::env::set_var("CLAUDE_CODE_SYNC_CONFIG_DIR", dir.path());
+        let _config_env = ConfigEnvGuard::set(dir.path());
 
         let outer = RepoLock::acquire(dir.path()).unwrap();
         assert!(matches!(outer, RepoLockOutcome::Acquired(_)));
@@ -169,7 +188,6 @@ mod tests {
         drop(outer);
         assert!(!REPO_LOCK_HELD.load(Ordering::SeqCst));
 
-        std::env::remove_var("CLAUDE_CODE_SYNC_CONFIG_DIR");
     }
 
     #[test]
@@ -177,7 +195,7 @@ mod tests {
     fn flag_is_cleared_when_guard_drops() {
         reset_flag();
         let dir = tempdir().unwrap();
-        std::env::set_var("CLAUDE_CODE_SYNC_CONFIG_DIR", dir.path());
+        let _config_env = ConfigEnvGuard::set(dir.path());
 
         {
             let _lock = RepoLock::acquire(dir.path()).unwrap();
@@ -189,14 +207,13 @@ mod tests {
         let again = RepoLock::acquire(dir.path()).unwrap();
         assert!(matches!(again, RepoLockOutcome::Acquired(_)));
 
-        std::env::remove_var("CLAUDE_CODE_SYNC_CONFIG_DIR");
     }
 
     #[test]
     #[serial]
     fn lock_path_differs_per_repository() {
         let config = tempdir().unwrap();
-        std::env::set_var("CLAUDE_CODE_SYNC_CONFIG_DIR", config.path());
+        let _config_env = ConfigEnvGuard::set(config.path());
         let first = tempdir().unwrap();
         let second = tempdir().unwrap();
 
@@ -208,6 +225,5 @@ mod tests {
         let with_slash = ConfigManager::sync_repo_lock_path(&first.path().join("")).unwrap();
         assert_eq!(a, with_slash);
 
-        std::env::remove_var("CLAUDE_CODE_SYNC_CONFIG_DIR");
     }
 }

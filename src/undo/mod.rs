@@ -35,6 +35,41 @@ mod tests {
     use tempfile::{tempdir, TempDir};
     use uuid::Uuid;
 
+    #[test]
+    fn rejected_undo_preserves_history_snapshot_and_destination_absence() {
+        let allowed = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let destination = outside.path().join("never-created/file.jsonl");
+        let snapshot = Snapshot {
+            snapshot_id: Uuid::new_v4().to_string(),
+            timestamp: chrono::Utc::now(),
+            operation_type: OperationType::Pull,
+            git_commit_hash: None,
+            files: [(
+                destination.to_string_lossy().into_owned(),
+                b"contents".to_vec(),
+            )]
+            .into(),
+            branch: None,
+            base_snapshot_id: None,
+            deleted_files: Vec::new(),
+        };
+        let snapshot_path = snapshot
+            .save_to_disk(Some(&allowed.path().join("snapshots")))
+            .unwrap();
+        let history_path = allowed.path().join("history.json");
+        let mut history = OperationHistory::from_path(Some(history_path.clone())).unwrap();
+        let mut record = OperationRecord::new(OperationType::Pull, None, Vec::new());
+        record.snapshot_path = Some(snapshot_path.clone());
+        history.operations.insert(0, record);
+        history.save_to(Some(history_path.clone())).unwrap();
+        let before = fs::read(&history_path).unwrap();
+        assert!(undo_pull(Some(history_path.clone()), Some(allowed.path())).is_err());
+        assert_eq!(fs::read(history_path).unwrap(), before);
+        assert!(snapshot_path.is_file());
+        assert!(!destination.parent().unwrap().exists());
+    }
+
     /// Helper to create a test file with content
     fn create_test_file(dir: &Path, name: &str, content: &str) -> PathBuf {
         let path = dir.join(name);
@@ -208,7 +243,7 @@ mod tests {
         );
         record.snapshot_path = Some(snapshot_path.clone());
 
-        history.add_operation(record).unwrap();
+        history.operations.insert(0, record);
         history.save_to(Some(history_path.clone())).unwrap();
 
         // Modify the file (simulating changes from pull)
@@ -251,7 +286,7 @@ mod tests {
         // Set a snapshot path that doesn't exist
         record.snapshot_path = Some(PathBuf::from("/nonexistent/snapshot.json"));
 
-        history.add_operation(record).unwrap();
+        history.operations.insert(0, record);
         history.save_to(Some(history_path.clone())).unwrap();
 
         // Try to undo
@@ -287,8 +322,6 @@ mod tests {
 
         let snapshot_path = snapshot.save_to_disk(Some(&snapshots_dir)).unwrap();
 
-        // Create operation history with a push operation
-        let mut history = OperationHistory::from_path(Some(history_path.clone())).unwrap();
 
         let conv_summary = ConversationSummary::new(
             "test-session".to_string(),
@@ -306,11 +339,15 @@ mod tests {
         );
         record.snapshot_path = Some(snapshot_path.clone());
 
-        history.add_operation(record).unwrap();
+        let history = OperationHistory {
+            operations: vec![record],
+        };
         history.save_to(Some(history_path.clone())).unwrap();
+        // A soft reset must also succeed with uncommitted worktree changes.
+        fs::write(&new_file, "uncommitted content").unwrap();
 
         // Undo the push
-        let result = undo_push(temp_dir.path(), Some(history_path)).unwrap();
+        let result = undo_push(temp_dir.path(), Some(history_path.clone())).unwrap();
         assert!(result.contains("Successfully undone"));
         assert!(result.contains(&initial_hash[..8]));
 
@@ -318,6 +355,9 @@ mod tests {
         let repo_check = scm::open(temp_dir.path()).unwrap();
         let current_hash = repo_check.current_commit_hash().unwrap();
         assert_eq!(current_hash, initial_hash);
+        assert_eq!(fs::read_to_string(&new_file).unwrap(), "uncommitted content");
+        assert!(OperationHistory::from_path(Some(history_path)).unwrap().is_empty());
+        assert!(!snapshot_path.exists());
     }
 
     #[test]
@@ -372,7 +412,7 @@ mod tests {
         );
         record.snapshot_path = Some(snapshot_path);
 
-        history.add_operation(record).unwrap();
+        history.operations.insert(0, record);
         history.save_to(Some(history_path.clone())).unwrap();
 
         // Initialize a repo for testing
@@ -488,55 +528,6 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_path_traversal_protection() {
-        let _temp_dir = tempdir().unwrap();
-
-        // Create a malicious snapshot that tries to write outside home directory
-        let mut malicious_snapshot = Snapshot {
-            snapshot_id: Uuid::new_v4().to_string(),
-            timestamp: chrono::Utc::now(),
-            operation_type: OperationType::Pull,
-            git_commit_hash: None,
-            files: HashMap::new(),
-            branch: None,
-            base_snapshot_id: None,
-            deleted_files: Vec::new(),
-        };
-
-        // Try to add a path that escapes the home directory using ..
-        // This should be caught by canonicalization
-        let home = dirs::home_dir().unwrap();
-        let evil_path = home.join("..").join("..").join("etc").join("passwd");
-
-        malicious_snapshot.files.insert(
-            evil_path.to_string_lossy().to_string(),
-            b"malicious content".to_vec(),
-        );
-
-        // Attempting to restore should fail due to path traversal protection
-        let result = malicious_snapshot.restore();
-
-        // The restore should either fail during path validation
-        // or the path should not be outside home dir after canonicalization
-        if let Err(error) = result {
-            let err_msg = error.to_string();
-            // Should contain security error message
-            assert!(
-                err_msg.contains("Security") || err_msg.contains("outside home"),
-                "Error message should indicate security issue: {err_msg}"
-            );
-        } else {
-            // If it didn't error, verify the file wasn't written outside home
-            assert!(
-                !PathBuf::from("/etc/passwd").exists()
-                    || !fs::read_to_string("/etc/passwd")
-                        .unwrap_or_default()
-                        .contains("malicious")
-            );
-        }
-    }
-
-    #[test]
     fn test_snapshot_create_handles_missing_files() {
         let temp_dir = tempdir().unwrap();
 
@@ -599,7 +590,7 @@ mod tests {
             vec![conv_summary.clone()],
         );
         record1.snapshot_path = Some(snapshot_path1.clone());
-        history.add_operation(record1).unwrap();
+        history.operations.insert(0, record1);
 
         // Add a push operation
         let mut push_record = OperationRecord::new(
@@ -608,7 +599,7 @@ mod tests {
             vec![conv_summary.clone()],
         );
         push_record.snapshot_path = None;
-        history.add_operation(push_record).unwrap();
+        history.operations.insert(0, push_record);
 
         // Add second pull (most recent)
         let mut record2 = OperationRecord::new(
@@ -617,7 +608,7 @@ mod tests {
             vec![conv_summary.clone()],
         );
         record2.snapshot_path = Some(snapshot_path2.clone());
-        history.add_operation(record2).unwrap();
+        history.operations.insert(0, record2);
 
         history.save_to(Some(history_path.clone())).unwrap();
 
@@ -679,7 +670,7 @@ mod tests {
             vec![conv_summary.clone()],
         );
         pull_record.snapshot_path = None;
-        history.add_operation(pull_record).unwrap();
+        history.operations.insert(0, pull_record);
 
         // Add the push operation
         let mut push_record = OperationRecord::new(
@@ -688,7 +679,7 @@ mod tests {
             vec![conv_summary],
         );
         push_record.snapshot_path = Some(snapshot_path.clone());
-        history.add_operation(push_record).unwrap();
+        history.operations.insert(0, push_record);
 
         history.save_to(Some(history_path.clone())).unwrap();
 
@@ -710,166 +701,34 @@ mod tests {
     }
 
     #[test]
-    fn test_undo_pull_transaction_safety() {
-        // This test verifies that history is updated FIRST, then files are restored.
-        // If file restoration fails, the history should already be updated.
-        let temp_dir = tempdir().unwrap();
-        let history_path = temp_dir.path().join("history.json");
-        let snapshots_dir = temp_dir.path().join("snapshots");
-
-        // Create a test file
-        let file1 = create_test_file(temp_dir.path(), "conversation.jsonl", "original");
-
-        // Create a snapshot
-        let snapshot = Snapshot::create(OperationType::Pull, vec![&file1], None).unwrap();
-        let snapshot_path = snapshot.save_to_disk(Some(&snapshots_dir)).unwrap();
-
-        // Create operation history with a pull operation
-        let mut history = OperationHistory::from_path(Some(history_path.clone())).unwrap();
-
-        let conv_summary = ConversationSummary::new(
-            "test-session".to_string(),
-            "test/path".to_string(),
-            None,
-            5,
-            SyncOperation::Modified,
-        )
-        .unwrap();
-
-        let mut record = OperationRecord::new(
-            OperationType::Pull,
-            Some("main".to_string()),
-            vec![conv_summary],
-        );
-        record.snapshot_path = Some(snapshot_path.clone());
-
-        history.add_operation(record).unwrap();
-        history.save_to(Some(history_path.clone())).unwrap();
-
-        // Verify we have 1 operation before undo
-        let loaded = OperationHistory::from_path(Some(history_path.clone())).unwrap();
-        assert_eq!(loaded.len(), 1);
-
-        // Modify the file (simulating changes from pull)
-        fs::write(&file1, "modified by pull").unwrap();
-
-        // Make the file read-only to cause restoration to potentially fail
-        // (though on most systems this won't prevent writing, we can at least test the order)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&file1).unwrap().permissions();
-            perms.set_mode(0o444); // read-only
-            fs::set_permissions(&file1, perms).unwrap();
-        }
-
-        // Attempt undo - this might fail on file restoration
-        let result = undo_pull(Some(history_path.clone()), Some(temp_dir.path()));
-
-        // Whether it succeeds or fails, the history should be updated
-        // (because we update history FIRST)
-        let loaded_after = OperationHistory::from_path(Some(history_path.clone())).unwrap();
-
-        // The key assertion: history should be updated (0 operations)
-        // This proves we updated history before attempting file restoration
-        assert_eq!(
-            loaded_after.len(),
-            0,
-            "History should be updated even if file restoration fails"
-        );
-
-        // Verify the snapshot file is removed if successful, or remains if failed
-        if result.is_ok() {
-            assert!(
-                !snapshot_path.exists(),
-                "Snapshot should be cleaned up on success"
-            );
-        }
-
-        // Clean up permissions for temp dir deletion
-        #[cfg(unix)]
-        {
-            if file1.exists() {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = fs::metadata(&file1).unwrap().permissions();
-                perms.set_mode(0o644);
-                let _ = fs::set_permissions(&file1, perms);
-            }
-        }
-    }
-
-    #[test]
-    fn test_undo_push_transaction_safety() {
-        // This test verifies that history is updated FIRST, then reset is performed.
+    fn test_undo_push_invalid_commit_preserves_history_and_snapshot_bytes() {
         let (temp_dir, repo) = setup_test_repo();
         let history_path = temp_dir.path().join("history.json");
-        let snapshots_dir = temp_dir.path().join("snapshots");
-
-        // Get the initial commit hash
         let initial_hash = repo.current_commit_hash().unwrap();
-
-        // Create and commit a new file (simulating a push)
-        let new_file = temp_dir.path().join("new.txt");
-        fs::write(&new_file, "new content").unwrap();
-        repo.stage_all().unwrap();
-        repo.commit("Second commit").unwrap();
-
-        // Create a snapshot with the initial commit hash
-        let mut snapshot =
-            Snapshot::create(OperationType::Push, vec![&new_file], Some(&initial_hash)).unwrap();
-        snapshot.git_commit_hash = Some(initial_hash.clone());
-        let snapshot_path = snapshot.save_to_disk(Some(&snapshots_dir)).unwrap();
-
-        // Create operation history with a push operation
-        let mut history = OperationHistory::from_path(Some(history_path.clone())).unwrap();
-
-        let conv_summary = ConversationSummary::new(
-            "test-session".to_string(),
-            "test/path".to_string(),
-            None,
-            5,
-            SyncOperation::Added,
+        let snapshot = Snapshot::create(
+            OperationType::Push,
+            Vec::<&Path>::new(),
+            Some("this-commit-does-not-exist"),
         )
         .unwrap();
-
-        let mut record = OperationRecord::new(
-            OperationType::Push,
-            Some("master".to_string()),
-            vec![conv_summary],
-        );
+        let snapshot_path = snapshot
+            .save_to_disk(Some(&temp_dir.path().join("snapshots")))
+            .unwrap();
+        let mut record = OperationRecord::new(OperationType::Push, None, Vec::new());
         record.snapshot_path = Some(snapshot_path.clone());
-
-        history.add_operation(record).unwrap();
+        let history = OperationHistory {
+            operations: vec![record],
+        };
         history.save_to(Some(history_path.clone())).unwrap();
+        let history_before = fs::read(&history_path).unwrap();
+        let snapshot_before = fs::read(&snapshot_path).unwrap();
 
-        // Verify we have 1 operation before undo
-        let loaded = OperationHistory::from_path(Some(history_path.clone())).unwrap();
-        assert_eq!(loaded.len(), 1);
+        let error = undo_push(temp_dir.path(), Some(history_path.clone())).unwrap_err();
 
-        // Perform undo
-        let result = undo_push(temp_dir.path(), Some(history_path.clone()));
-
-        // Whether it succeeds or fails, the history should be updated FIRST
-        let loaded_after = OperationHistory::from_path(Some(history_path.clone())).unwrap();
-
-        // The key assertion: history should be updated (0 operations)
-        // This proves we updated history before attempting git reset
-        assert_eq!(
-            loaded_after.len(),
-            0,
-            "History should be updated even if git reset fails"
-        );
-
-        // If successful, verify we're back at the initial commit
-        if result.is_ok() {
-            let repo_check = scm::open(temp_dir.path()).unwrap();
-            let current_hash = repo_check.current_commit_hash().unwrap();
-            assert_eq!(current_hash, initial_hash);
-            assert!(
-                !snapshot_path.exists(),
-                "Snapshot should be cleaned up on success"
-            );
-        }
+        assert!(error.to_string().contains("Failed to reset repository"));
+        assert_eq!(repo.current_commit_hash().unwrap(), initial_hash);
+        assert_eq!(fs::read(&history_path).unwrap(), history_before);
+        assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot_before);
     }
 
     // ============================================================================

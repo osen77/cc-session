@@ -125,6 +125,85 @@ pub struct ConversationSession {
 }
 
 impl ConversationSession {
+    /// Read and validate one fixed-length snapshot; never publish recovered bad lines.
+    pub(crate) fn from_stable_snapshot(path: &Path) -> Result<Self> {
+        let mut last_error = None;
+        for attempt in 0..3 {
+            match Self::read_stable_snapshot(path) {
+                Ok(session) => return Ok(session),
+                Err(error) => last_error = Some(error),
+            }
+            if attempt < 2 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        Err(last_error.expect("snapshot was attempted"))
+    }
+
+    fn read_stable_snapshot(path: &Path) -> Result<Self> {
+        Self::read_stable_snapshot_with_hook(path, || Ok(()))
+    }
+
+    fn read_stable_snapshot_with_hook(
+        path: &Path,
+        after_read: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(path)?;
+        let before = file.metadata()?;
+        anyhow::ensure!(before.is_file(), "snapshot source is not a regular file");
+        let size = usize::try_from(before.len()).context("snapshot too large")?;
+        let mut bytes = vec![0; size];
+        file.read_exact(&mut bytes)?;
+        after_read()?;
+        anyhow::ensure!(
+            bytes.is_empty() || bytes.last() == Some(&b'\n'),
+            "incomplete JSONL final line"
+        );
+        let digest = blake3::hash(&bytes);
+        file.seek(SeekFrom::Start(0))?;
+        let mut hasher = blake3::Hasher::new();
+        let mut remaining = size;
+        let mut buffer = [0u8; 65536];
+        while remaining > 0 {
+            let count = remaining.min(buffer.len());
+            file.read_exact(&mut buffer[..count])?;
+            hasher.update(&buffer[..count]);
+            remaining -= count;
+        }
+        anyhow::ensure!(
+            hasher.finalize() == digest,
+            "snapshot prefix changed while reading"
+        );
+        let after = std::fs::symlink_metadata(path)?;
+        anyhow::ensure!(
+            after.is_file() && !after.file_type().is_symlink(),
+            "snapshot path changed"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            anyhow::ensure!(
+                before.dev() == after.dev() && before.ino() == after.ino(),
+                "snapshot file identity changed"
+            );
+        }
+        anyhow::ensure!(after.len() >= before.len(), "snapshot file truncated");
+        let parsed = Self::from_bytes_with_report(&bytes, path)?;
+        anyhow::ensure!(
+            parsed.malformed_lines == 0,
+            "snapshot contains malformed JSONL"
+        );
+        Ok(parsed.value)
+    }
+
     /// Parse a JSONL file into a ConversationSession, discarding corruption details.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         Ok(Self::from_file_with_report(path)?.value)
@@ -1568,5 +1647,53 @@ not-json
         assert_eq!(outcome.value.entries.len(), 1);
         assert_eq!(outcome.malformed_lines, 1);
         assert_eq!(outcome.value.file_path, "/isolated/session.jsonl");
+    }
+    #[test]
+    fn strict_snapshot_rejects_partial_jsonl_instead_of_publishing_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            b"{\"type\":\"user\",\"sessionId\":\"session\"}\n{\"type\":",
+        )
+        .unwrap();
+        assert!(ConversationSession::from_stable_snapshot(&path).is_err());
+        std::fs::write(&path, b"{\"type\":\"user\",\"sessionId\":\"session\"}\n").unwrap();
+        let snapshot = ConversationSession::from_stable_snapshot(&path).unwrap();
+        assert_eq!(snapshot.session_id, "session");
+        assert_eq!(snapshot.entries.len(), 1);
+    }
+    #[test]
+    fn strict_snapshot_accepts_append_but_rejects_prefix_rewrite_and_inode_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let original = b"{\"type\":\"user\",\"sessionId\":\"session\"}\n";
+        std::fs::write(&path, original).unwrap();
+        let session = ConversationSession::read_stable_snapshot_with_hook(&path, || {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)?
+                .write_all(b"{\"type\":\"assistant\"}\n")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(session.entries.len(), 1);
+        assert!(
+            ConversationSession::read_stable_snapshot_with_hook(&path, || {
+                std::fs::write(&path, b"{\"type\":\"user\",\"sessionId\":\"changed\"}\n")?;
+                Ok(())
+            })
+            .is_err()
+        );
+        std::fs::write(&path, original).unwrap();
+        assert!(
+            ConversationSession::read_stable_snapshot_with_hook(&path, || {
+                let replacement = dir.path().join("replacement");
+                std::fs::write(&replacement, original)?;
+                std::fs::rename(replacement, &path)?;
+                Ok(())
+            })
+            .is_err()
+        );
     }
 }

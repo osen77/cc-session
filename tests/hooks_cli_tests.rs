@@ -216,7 +216,8 @@ struct PythonLockHolder {
 #[cfg(unix)]
 impl PythonLockHolder {
     fn hold(path: &Path) -> Self {
-        let mut child = Command::new("python3")
+        let python = if cfg!(target_os = "macos") { "/usr/bin/python3" } else { "python3" };
+        let mut child = Command::new(python)
             .args([
                 "-c",
                 "import fcntl,sys,time; f=open(sys.argv[1], 'a+'); fcntl.flock(f, fcntl.LOCK_EX); print('ready', flush=True); time.sleep(30)",
@@ -672,4 +673,52 @@ fn repeated_worker_failures_alert_once() {
 
     let (deduplicated, _) = fixture.run_stop();
     assert_success(&deduplicated, "deduplicated alert invocation");
+}
+
+#[test]
+#[serial]
+fn runtime_disabled_hooks_do_not_sync_or_touch_hook_state() {
+    let fixture = Fixture::new();
+    let settings =
+        json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "notify-user"}]}]}});
+    fixture.write_settings(&settings);
+    let commits = fixture.commit_count();
+    assert_success(&fixture.run(&["hooks", "disable"], b""), "disable hooks");
+    for args in [
+        vec!["hook-session-start"],
+        vec!["hook-stop"],
+        vec!["hook-stop", "--worker"],
+        vec!["hook-new-project-check"],
+    ] {
+        assert_success(&fixture.run(&args, b"invalid input"), "disabled hook");
+    }
+    assert_eq!(fixture.commit_count(), commits);
+    for name in [
+        "push-hook.stamp",
+        "push-hook-state.json",
+        "last-session-pull",
+        "new-project-pull-state.json",
+    ] {
+        assert!(!fixture.config.path().join(name).exists(), "{name}");
+    }
+    let status = fixture.run(&["hooks", "status"], b"");
+    assert_success(&status, "status");
+    assert!(String::from_utf8_lossy(&status.stdout).contains("disabled"));
+    assert_eq!(fixture.read_settings(), settings);
+    assert_success(
+        &fixture.run(&["hooks", "check", "--quiet"], b""),
+        "intentional pause is not drift",
+    );
+    fs::write(fixture.config.path().join("state.json"), b"invalid state").unwrap();
+    for subcommand in ["pull", "push"] {
+        let mut command = fixture.command(&[subcommand]);
+        command.env("CCS_AUTOMATIC_HOOK", "1");
+        assert_success(
+            &run_with_timeout(command, b"", CHILD_TIMEOUT),
+            "disabled residual child",
+        );
+    }
+    assert_success(&fixture.run(&["hooks", "enable"], b""), "enable hooks");
+    let status = fixture.run(&["hooks", "status"], b"");
+    assert!(String::from_utf8_lossy(&status.stdout).contains("enabled"));
 }

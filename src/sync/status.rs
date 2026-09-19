@@ -4,10 +4,13 @@ use std::path::Path;
 
 use crate::config::ConfigManager;
 use crate::filter::FilterConfig;
-use crate::path_security::{validate_directory_root, validate_sync_projects_root};
+use crate::path_security::validate_sync_projects_root;
 use crate::scm;
 
-use super::discovery::{claude_projects_dir, count_unique_sessions, discover_sessions};
+use super::discovery::{
+    claude_projects_dir, count_unique_sessions, count_unique_sessions_in_roots,
+    discover_local_sessions,
+};
 use super::state::SyncState;
 
 /// Show sync status
@@ -15,7 +18,9 @@ pub fn show_status(show_conflicts: bool, show_files: bool) -> Result<()> {
     let state = SyncState::load()?;
     let repo = scm::open(&state.sync_repo_path)?;
     let filter = FilterConfig::load()?;
+    let root_mappings = filter.root_mappings()?;
     let claude_dir = claude_projects_dir()?;
+    let local_roots = crate::project_roots::enumerate(&claude_dir, &root_mappings)?;
 
     println!("{}", "=== Claude Code Sync Status ===".bold().cyan());
     println!();
@@ -75,8 +80,7 @@ pub fn show_status(show_conflicts: bool, show_files: bool) -> Result<()> {
     // instead of fully parsing every conversation file.
     println!();
     println!("{}", "对话历史:".bold());
-    validate_directory_root(&claude_dir)?;
-    let local_session_count = count_unique_sessions(&claude_dir, &filter)?;
+    let local_session_count = count_unique_sessions_in_roots(&local_roots, &filter)?;
     println!("  本地: {} 个会话", local_session_count.to_string().cyan());
 
     let remote_projects_dir = state.sync_repo_path.join(&filter.sync_subdirectory);
@@ -148,7 +152,7 @@ pub fn show_status(show_conflicts: bool, show_files: bool) -> Result<()> {
     if show_files {
         println!();
         println!("{}", "本地会话文件:".bold());
-        let local_sessions = discover_sessions(&claude_dir, &filter)?;
+        let local_sessions = discover_local_sessions(&claude_dir, &filter, false)?;
         for session in local_sessions.iter().take(20) {
             let relative = Path::new(&session.file_path)
                 .strip_prefix(&claude_dir)
@@ -177,4 +181,100 @@ pub fn show_status(show_conflicts: bool, show_files: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CONFIG_DIR_ENV;
+    use crate::project_roots::{with_test_volume, ExternalProjectsRoot, VolumeIdentity};
+    use crate::sync::state::SyncState;
+    use serial_test::serial;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use tempfile::tempdir;
+
+    struct EnvGuard {
+        home: Option<std::ffi::OsString>,
+        config: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.home.take() {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.config.take() {
+                Some(value) => std::env::set_var(CONFIG_DIR_ENV, value),
+                None => std::env::remove_var(CONFIG_DIR_ENV),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn external_root_status_is_readable_and_fail_closed_without_state_changes() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        let config_dir = temp.path().join("config");
+        let logical = home.join(".claude/projects");
+        let mount = temp.path().join("volume");
+        let trusted = mount.join("Claude");
+        let target = trusted.join("projects");
+        let project = target.join("project");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir_all(logical.parent().unwrap()).unwrap();
+        fs::create_dir_all(project.join("memory")).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            project.join("session.jsonl"),
+            br#"{"type":"user","sessionId":"sid","cwd":"/work/project","message":{"role":"user","content":"hello"}}
+"#,
+        )
+        .unwrap();
+        symlink(&target, &logical).unwrap();
+        crate::scm::init(&repo_path).unwrap();
+
+        let guard = EnvGuard {
+            home: std::env::var_os("HOME"),
+            config: std::env::var_os(CONFIG_DIR_ENV),
+        };
+        std::env::set_var("HOME", &home);
+        std::env::set_var(CONFIG_DIR_ENV, &config_dir);
+        let state = SyncState {
+            sync_repo_path: repo_path,
+            has_remote: false,
+            is_cloned_repo: false,
+            last_synced_commit: None,
+        };
+        state.save().unwrap();
+        let external = ExternalProjectsRoot {
+            target: target.clone(),
+            trusted_root: trusted,
+            volume_uuid: "AF9C9871-18AE-40C9-8D18-624E415520C6".into(),
+        };
+        let mut filter = FilterConfig::default();
+        filter.external_projects_root = Some(external.clone());
+        filter.save().unwrap();
+        let state_before = fs::read(ConfigManager::state_file_path().unwrap()).unwrap();
+        let config_before = fs::read(ConfigManager::filter_config_path().unwrap()).unwrap();
+        let volume = VolumeIdentity {
+            mount_point: mount,
+            volume_uuid: external.volume_uuid.clone(),
+            device_id: {
+                use std::os::unix::fs::MetadataExt;
+                fs::metadata(temp.path()).unwrap().dev()
+            },
+        };
+
+        with_test_volume(volume, || {
+            show_status(false, false).unwrap();
+            fs::remove_dir_all(&target).unwrap();
+            assert!(show_status(false, false).is_err());
+            assert_eq!(fs::read(ConfigManager::state_file_path().unwrap()).unwrap(), state_before);
+            assert_eq!(fs::read(ConfigManager::filter_config_path().unwrap()).unwrap(), config_before);
+        });
+        drop(guard);
+    }
 }

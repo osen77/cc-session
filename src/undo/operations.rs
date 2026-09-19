@@ -62,23 +62,14 @@ pub fn undo_pull(history_path: Option<PathBuf>, allowed_base_dir: Option<&Path>)
     let restored_files: Vec<String> = snapshot.files.keys().cloned().collect();
     let file_count = restored_files.len();
 
-    // TRANSACTION-LIKE ORDERING: Update history FIRST, then restore files.
-    // This ensures that if file restoration fails, the history is still consistent
-    // and accurately reflects that we've attempted the undo. The snapshot file
-    // remains on disk until we successfully complete the restoration.
-
-    // Step 1: Remove the pull operation from history
+    // Failed validation or restoration must retain both history and snapshot.
+    snapshot
+        .restore_with_base(allowed_base_dir)
+        .context("Failed to restore snapshot")?;
     let mut history = OperationHistory::from_path(history_path.clone())?;
     history
         .remove_last_operation_by_type(OperationType::Pull, history_path.clone())
         .context("Failed to remove pull operation from history")?;
-
-    // Step 2: Restore the snapshot files
-    // If this fails, the history is already updated (which is safer than having
-    // an inconsistent history state)
-    snapshot
-        .restore_with_base(allowed_base_dir)
-        .context("Failed to restore snapshot")?;
 
     // Step 3: Clean up the snapshot file (only after successful restoration)
     if let Err(e) = fs::remove_file(snapshot_path) {
@@ -157,20 +148,15 @@ pub fn undo_push(repo_path: &Path, history_path: Option<PathBuf>) -> Result<Stri
     let branch_name = last_push.branch.as_deref().unwrap_or("unknown");
     let needs_force_push = repo.has_remote("origin");
 
-    // TRANSACTION-LIKE ORDERING: Update history FIRST, then perform reset.
-    // This ensures that if the reset fails, the history is still consistent.
-
-    // Step 1: Remove the push operation from history
-    let mut history = OperationHistory::from_path(history_path.clone())?;
-    history
-        .remove_last_operation_by_type(OperationType::Push, history_path.clone())
-        .context("Failed to remove push operation from history")?;
-
-    // Step 2: Perform the reset
+    // Keep the operation and legacy snapshot intact unless reset succeeds.
     repo.reset_soft(&target_commit)
         .context("Failed to reset repository to previous commit")?;
 
-    // Step 3: Clean up legacy snapshot file if it exists
+    // Remove the selected record from current history, not a later push.
+    OperationHistory::remove_operation(last_push, history_path)
+        .context("Failed to remove push operation from history")?;
+
+    // Clean up legacy snapshot only after reset and history persistence succeed.
     if let Some(ref snapshot_path) = last_push.snapshot_path {
         if snapshot_path.exists() {
             if let Err(e) = fs::remove_file(snapshot_path) {

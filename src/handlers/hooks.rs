@@ -25,6 +25,40 @@ const PUSH_HOOK_ALERT_THRESHOLD: u32 = 3;
 const NEW_PROJECT_PULL_COOLDOWN_SECS: u64 = 600;
 const HOOK_FIELDS: &[&str] = &["type", "command", "timeout", "statusMessage"];
 
+/// Fail closed when the dedicated marker cannot be inspected.
+pub fn runtime_hooks_enabled() -> bool {
+    let Ok(dir) = ConfigManager::config_dir() else {
+        return false;
+    };
+    match std::fs::symlink_metadata(dir.join("hooks-disabled")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        _ => false,
+    }
+}
+
+pub fn handle_hooks_runtime(enabled: Option<bool>) -> Result<()> {
+    let dir = ConfigManager::ensure_config_dir()?;
+    let marker = dir.join("hooks-disabled");
+    match enabled {
+        Some(false) => persist_json_atomic(&marker, &json!({"disabled": true}))?,
+        Some(true) => match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        },
+        None => {}
+    }
+    println!(
+        "hooks {}",
+        if runtime_hooks_enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    Ok(())
+}
+
 fn append_hook_debug(message: &str) {
     use std::io::Write;
 
@@ -52,6 +86,7 @@ fn spawn_ccs_subcommand(
     Command::new(exe)
         .arg(subcommand)
         .args(args)
+        .env("CCS_AUTOMATIC_HOOK", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -63,6 +98,7 @@ fn detached_subcommand_command(exe: &Path, subcommand: &str, args: &[&str]) -> C
     command
         .arg(subcommand)
         .args(args)
+        .env("CCS_AUTOMATIC_HOOK", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -563,6 +599,9 @@ fn read_hook_settings() -> Result<Value> {
 
 /// Show current hooks configuration status.
 pub fn handle_hooks_show() -> Result<()> {
+    if !runtime_hooks_enabled() {
+        return handle_hooks_runtime(None);
+    }
     let settings_path = claude_settings_path()?;
     let settings = read_hook_settings()?;
     let expected = get_hooks_config();
@@ -614,6 +653,12 @@ pub fn handle_hooks_show() -> Result<()> {
 
 /// Check whether installed hooks match this ccs version.
 pub fn handle_hooks_check(quiet: bool) -> Result<()> {
+    if !runtime_hooks_enabled() {
+        if !quiet {
+            println!("hooks disabled");
+        }
+        return Ok(());
+    }
     let drift = detect_hook_drift(&read_hook_settings()?, &get_hooks_config());
     if drift.is_empty() {
         return Ok(());
@@ -684,7 +729,10 @@ fn process_new_project_check(
     now: u64,
     mut spawn_pull: impl FnMut() -> std::io::Result<()>,
 ) -> Option<String> {
-    use crate::sync::discovery::find_local_project_by_name;
+    use crate::sync::discovery::find_mapped_local_project_by_name;
+    if !runtime_hooks_enabled() {
+        return None;
+    }
 
     // UserPromptSubmit is only meaningful at the git repository root. In
     // particular, do not treat a nested source directory or a temporary cwd as
@@ -697,7 +745,20 @@ fn process_new_project_check(
         .split(&['/', '\\'])
         .rfind(|s| !s.is_empty())
         .unwrap_or("unknown");
-    let has_local_project = find_local_project_by_name(claude_dir, project_name).is_some();
+    let has_local_project = match crate::filter::FilterConfig::load() {
+        Ok(config) => config
+            .root_mappings()
+            .ok()
+            .and_then(|mappings| {
+                find_mapped_local_project_by_name(claude_dir, &mappings, project_name).ok()
+            })
+            .flatten()
+            .is_some(),
+        Err(error) => {
+            log::warn!("Skipping new-project check because filter config is unavailable: {error:#}");
+            return None;
+        }
+    };
     let mut state = NewProjectPullState::load();
 
     if has_local_project {
@@ -734,6 +795,9 @@ fn process_new_project_check(
 /// This is called by the UserPromptSubmit hook to detect new projects
 /// Reads JSON from stdin, outputs JSON to stdout
 pub fn handle_new_project_check() -> Result<()> {
+    if !runtime_hooks_enabled() {
+        return Ok(());
+    }
     use crate::sync::discovery::claude_projects_dir;
 
     // Read hook input from stdin
@@ -868,6 +932,9 @@ fn record_worker_failure(error: anyhow::Error) {
 }
 
 fn run_stop_worker() {
+    if !runtime_hooks_enabled() {
+        return;
+    }
     let lock_path = match ConfigManager::push_hook_lock_path() {
         Ok(path) => path,
         Err(error) => {
@@ -886,6 +953,9 @@ fn run_stop_worker() {
             return;
         }
     };
+    if !runtime_hooks_enabled() {
+        return;
+    }
 
     let stamp_path = match ConfigManager::push_hook_stamp_path() {
         Ok(path) => path,
@@ -917,6 +987,9 @@ fn run_stop_worker() {
             return;
         }
     };
+    if !runtime_hooks_enabled() {
+        return;
+    }
 
     let push_result = crate::sync::push_history(
         None,
@@ -924,6 +997,7 @@ fn run_stop_worker() {
         None,
         false,
         true,
+        false,
         false,
         false,
         VerbosityLevel::Quiet,
@@ -993,6 +1067,9 @@ fn report_pending_alert() -> Result<()> {
 /// worker. The worker owns both the hook lock and repository lock, so the hook
 /// harness can return immediately without leaving lock lifetime ambiguous.
 pub fn handle_stop(worker: bool) -> Result<()> {
+    if !runtime_hooks_enabled() {
+        return Ok(());
+    }
     if worker {
         run_stop_worker();
         return Ok(());
@@ -1181,6 +1258,9 @@ fn run_session_start_gate(
     let Some(_lock) = FileLock::try_acquire(lock_path)? else {
         return Ok(false);
     };
+    if !runtime_hooks_enabled() {
+        return Ok(false);
+    }
     let debounce_active = session_start_debounce_active(stamp_path, now);
     if !should_run_session_start_pull(observation, source, debounce_active) {
         return Ok(false);
@@ -1199,6 +1279,9 @@ fn run_session_start_gate(
 /// one confidently identified startup process may pull, and the cooldown check,
 /// stamp update, and pull execution share one lock.
 pub fn handle_session_start() -> Result<()> {
+    if !runtime_hooks_enabled() {
+        return Ok(());
+    }
     let input: Value = serde_json::from_reader(std::io::stdin()).unwrap_or(json!({}));
     let source = input
         .get("source")
@@ -1616,6 +1699,138 @@ mod tests {
         assert!(!ConfigManager::new_project_pull_state_path()
             .unwrap()
             .exists());
+    }
+
+    #[test]
+    #[serial]
+    fn new_project_check_does_not_fallback_when_root_config_is_mixed() {
+        let config_dir = tempdir().unwrap();
+        let _guard = EnvGuard::set(config_dir.path());
+        let claude_dir = tempdir().unwrap();
+        let git_root = tempdir().unwrap();
+        std::fs::create_dir(git_root.path().join(".git")).unwrap();
+        let project_name = git_root.path().file_name().unwrap().to_str().unwrap();
+        std::fs::create_dir(claude_dir.path().join(format!("-tmp-{project_name}"))).unwrap();
+
+        let mut config = crate::filter::FilterConfig::default();
+        config.external_projects_root = Some(crate::project_roots::ExternalProjectsRoot {
+            target: PathBuf::from("/Volumes/Data/Claude/projects"),
+            trusted_root: PathBuf::from("/Volumes/Data/Claude"),
+            volume_uuid: "AF9C9871-18AE-40C9-8D18-624E415520C6".into(),
+        });
+        config.project_roots.push(crate::project_roots::ProjectRootMapping {
+            project_dir: "legacy".into(),
+            target: PathBuf::from("/Volumes/Data/Claude/projects/legacy"),
+            trusted_root: PathBuf::from("/Volumes/Data/Claude/projects"),
+            volume_uuid: "AF9C9871-18AE-40C9-8D18-624E415520C6".into(),
+        });
+        std::fs::write(
+            ConfigManager::filter_config_path().unwrap(),
+            toml::to_string(&config).unwrap(),
+        )
+        .unwrap();
+
+        let mut state = NewProjectPullState::default();
+        state.projects.insert(
+            project_name.to_string(),
+            NewProjectPullAttempt {
+                last_attempt_unix: 100,
+                pending_notify: true,
+            },
+        );
+        state.save();
+
+        let mut spawn_count = 0;
+        assert_eq!(
+            process_new_project_check(
+                git_root.path().to_str().unwrap(),
+                claude_dir.path(),
+                200,
+                || {
+                    spawn_count += 1;
+                    Ok(())
+                },
+            ),
+            None
+        );
+        assert_eq!(spawn_count, 0);
+        assert!(
+            NewProjectPullState::load()
+                .projects
+                .get(project_name)
+                .unwrap()
+                .pending_notify
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn new_project_check_malformed_config_does_not_spawn_for_missing_project() {
+        let config_dir = tempdir().unwrap();
+        let _guard = EnvGuard::set(config_dir.path());
+        let claude_dir = tempdir().unwrap();
+        let git_root = tempdir().unwrap();
+        std::fs::create_dir(git_root.path().join(".git")).unwrap();
+        std::fs::write(ConfigManager::filter_config_path().unwrap(), b"[broken\n").unwrap();
+        let mut spawn_count = 0;
+
+        assert_eq!(
+            process_new_project_check(
+                git_root.path().to_str().unwrap(),
+                claude_dir.path(),
+                200,
+                || {
+                    spawn_count += 1;
+                    Ok(())
+                },
+            ),
+            None
+        );
+        assert_eq!(spawn_count, 0);
+        assert!(!ConfigManager::new_project_pull_state_path()
+            .unwrap()
+            .exists());
+    }
+
+    #[test]
+    #[serial]
+    fn new_project_check_malformed_config_preserves_pending_state_for_existing_project() {
+        let config_dir = tempdir().unwrap();
+        let _guard = EnvGuard::set(config_dir.path());
+        let claude_dir = tempdir().unwrap();
+        let git_root = tempdir().unwrap();
+        std::fs::create_dir(git_root.path().join(".git")).unwrap();
+        let project_name = git_root.path().file_name().unwrap().to_str().unwrap();
+        std::fs::create_dir(claude_dir.path().join(format!("-tmp-{project_name}"))).unwrap();
+        std::fs::write(ConfigManager::filter_config_path().unwrap(), b"[broken\n").unwrap();
+
+        let mut state = NewProjectPullState::default();
+        state.projects.insert(
+            project_name.to_string(),
+            NewProjectPullAttempt {
+                last_attempt_unix: 100,
+                pending_notify: true,
+            },
+        );
+        state.save();
+        let state_path = ConfigManager::new_project_pull_state_path().unwrap();
+        let before = std::fs::read(&state_path).unwrap();
+        let mut spawn_count = 0;
+
+        assert_eq!(
+            process_new_project_check(
+                git_root.path().to_str().unwrap(),
+                claude_dir.path(),
+                200,
+                || {
+                    spawn_count += 1;
+                    Ok(())
+                },
+            ),
+            None
+        );
+        assert_eq!(spawn_count, 0);
+        assert_eq!(std::fs::read(state_path).unwrap(), before);
     }
 
     #[test]

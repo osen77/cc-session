@@ -79,6 +79,7 @@ pub mod interactive_conflict;
 pub mod filter;
 
 pub(crate) mod path_security;
+pub mod project_roots;
 
 /// Source Control Management abstraction layer.
 ///

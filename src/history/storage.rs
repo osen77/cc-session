@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+use crate::atomic_file::{persist_json_pretty_atomic, FileLock};
+
 use super::record::OperationRecord;
 use super::types::OperationType;
 
@@ -77,24 +79,8 @@ impl OperationHistory {
             None => Self::history_file_path()?,
         };
 
-        // Ensure parent directory exists
-        if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create history directory: {}", parent.display())
-            })?;
-        }
-
-        let content =
-            serde_json::to_string_pretty(self).context("Failed to serialize operation history")?;
-
-        fs::write(&file_path, content).with_context(|| {
-            format!(
-                "Failed to write operation history file to: {}",
-                file_path.display()
-            )
-        })?;
-
-        Ok(())
+        let _lock = FileLock::acquire(&file_path.with_extension("lock"))?;
+        persist_json_pretty_atomic(&file_path, self)
     }
 
     /// Save operation history to disk using default location
@@ -105,17 +91,20 @@ impl OperationHistory {
     /// Add a new operation record to history
     /// Automatically rotates older entries if history exceeds MAX_HISTORY_SIZE
     pub fn add_operation(&mut self, record: OperationRecord) -> Result<()> {
-        // Insert at the beginning (most recent first)
-        self.operations.insert(0, record);
+        self.add_operation_to(record, None)
+    }
 
-        // Rotate if we exceed the maximum size
-        if self.operations.len() > MAX_HISTORY_SIZE {
-            self.operations.truncate(MAX_HISTORY_SIZE);
-        }
-
-        // Persist to disk
-        self.save()?;
-
+    fn add_operation_to(&mut self, record: OperationRecord, path: Option<PathBuf>) -> Result<()> {
+        let file_path = match path {
+            Some(path) => path,
+            None => Self::history_file_path()?,
+        };
+        let _lock = FileLock::acquire(&file_path.with_extension("lock"))?;
+        let mut current = Self::from_path(Some(file_path.clone()))?;
+        current.operations.insert(0, record);
+        current.operations.truncate(MAX_HISTORY_SIZE);
+        persist_json_pretty_atomic(&file_path, &current)?;
+        *self = current;
         Ok(())
     }
 
@@ -163,6 +152,23 @@ impl OperationHistory {
     /// Check if history is empty
     pub fn is_empty(&self) -> bool {
         self.operations.is_empty()
+    }
+
+    /// Remove only the selected record, preserving operations appended since selection.
+    /// The on-disk record has no ID, so match its complete persisted value.
+    pub fn remove_operation(record: &OperationRecord, path: Option<PathBuf>) -> Result<bool> {
+        let file_path = match path {
+            Some(path) => path,
+            None => Self::history_file_path()?,
+        };
+        let _lock = FileLock::acquire(&file_path.with_extension("lock"))?;
+        let mut current = Self::from_path(Some(file_path.clone()))?;
+        let Some(index) = current.operations.iter().position(|candidate| candidate == record) else {
+            return Ok(false);
+        };
+        current.operations.remove(index);
+        persist_json_pretty_atomic(&file_path, &current)?;
+        Ok(true)
     }
 
     /// Remove the most recent operation of a specific type
@@ -234,7 +240,7 @@ mod tests {
         let record = OperationRecord::new(OperationType::Push, Some("main".to_string()), vec![]);
 
         // Add operation and save
-        history.add_operation(record).unwrap();
+        history.add_operation_to(record, Some(path.clone())).unwrap();
 
         // Save to test path
         history.save_to(Some(path.clone())).unwrap();
@@ -632,6 +638,45 @@ mod tests {
         let loaded = OperationHistory::from_path(Some(path)).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded.operations[0].operation_type, OperationType::Pull);
+    }
+
+    #[test]
+    fn test_remove_selected_operation_preserves_later_push_and_pull() {
+        let (_temp_dir, path) = setup_test_env();
+        let selected = OperationRecord::new(OperationType::Push, Some("selected".into()), vec![]);
+        let mut original = OperationHistory::new();
+        original.add_operation_to(selected.clone(), Some(path.clone())).unwrap();
+        let mut later = OperationHistory::from_path(Some(path.clone())).unwrap();
+        let push = OperationRecord::new(OperationType::Push, Some("later".into()), vec![]);
+        let pull = OperationRecord::new(OperationType::Pull, None, vec![]);
+        later.add_operation_to(push.clone(), Some(path.clone())).unwrap();
+        later.add_operation_to(pull.clone(), Some(path.clone())).unwrap();
+
+        assert!(OperationHistory::remove_operation(&selected, Some(path.clone())).unwrap());
+        let current = OperationHistory::from_path(Some(path.clone())).unwrap();
+        assert_eq!(current.operations, vec![pull, push]);
+        let before = fs::read(&path).unwrap();
+        assert!(!OperationHistory::remove_operation(&selected, Some(path.clone())).unwrap());
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn test_stale_history_append_preserves_later_records_without_resurrecting_undo() {
+        let (_temp_dir, path) = setup_test_env();
+        let selected = OperationRecord::new(OperationType::Push, Some("selected".into()), vec![]);
+        let mut stale = OperationHistory::new();
+        stale.add_operation_to(selected.clone(), Some(path.clone())).unwrap();
+        let later = OperationRecord::new(OperationType::Push, Some("later".into()), vec![]);
+        let mut current = OperationHistory::from_path(Some(path.clone())).unwrap();
+        current.add_operation_to(later.clone(), Some(path.clone())).unwrap();
+        assert!(OperationHistory::remove_operation(&selected, Some(path.clone())).unwrap());
+
+        let appended = OperationRecord::new(OperationType::Pull, None, vec![]);
+        stale.add_operation_to(appended.clone(), Some(path.clone())).unwrap();
+        assert_eq!(
+            OperationHistory::from_path(Some(path)).unwrap().operations,
+            vec![appended, later]
+        );
     }
 
     #[test]

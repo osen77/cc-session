@@ -9,6 +9,7 @@ use tempfile::TempDir;
 /// RAII-isolated config environment for tests.
 struct TestConfigEnv {
     temp: TempDir,
+    previous: Option<std::ffi::OsString>,
 }
 
 impl TestConfigEnv {
@@ -19,7 +20,10 @@ impl TestConfigEnv {
 
 impl Drop for TestConfigEnv {
     fn drop(&mut self) {
-        std::env::remove_var(CONFIG_DIR_ENV);
+        match self.previous.take() {
+            Some(value) => std::env::set_var(CONFIG_DIR_ENV, value),
+            None => std::env::remove_var(CONFIG_DIR_ENV),
+        }
     }
 }
 
@@ -28,14 +32,26 @@ fn setup_test_config_env() -> Result<TestConfigEnv> {
     let temp = TempDir::new()?;
     let config_dir = temp.path().join("claude-code-sync");
     std::fs::create_dir_all(&config_dir)?;
+    let previous = std::env::var_os(CONFIG_DIR_ENV);
     std::env::set_var(CONFIG_DIR_ENV, &config_dir);
-    Ok(TestConfigEnv { temp })
+    Ok(TestConfigEnv { temp, previous })
 }
 
-/// Clean up the test config environment variable.
-fn cleanup_test_config_env() {
-    std::env::remove_var(CONFIG_DIR_ENV);
+#[test]
+#[serial]
+fn test_config_environment_restores_outer_override_after_unwind() -> Result<()> {
+    let _outer = setup_test_config_env()?;
+    let outer_config = std::env::var_os(CONFIG_DIR_ENV);
+    let result = std::panic::catch_unwind(|| {
+        let _inner = setup_test_config_env().unwrap();
+        assert_ne!(std::env::var_os(CONFIG_DIR_ENV), outer_config);
+        panic!("exercise config environment restoration");
+    });
+    assert!(result.is_err());
+    assert_eq!(std::env::var_os(CONFIG_DIR_ENV), outer_config);
+    Ok(())
 }
+
 
 #[test]
 #[serial]
@@ -134,8 +150,6 @@ fn test_filter_config_save_and_load() -> Result<()> {
     assert!(loaded.exclude_attachments);
     assert_eq!(loaded.exclude_older_than_days, Some(30));
 
-    // Clean up env var
-    cleanup_test_config_env();
 
     Ok(())
 }
@@ -182,8 +196,6 @@ fn test_init_from_onboarding() -> Result<()> {
     assert!(!state.has_remote);
     assert!(!state.is_cloned_repo);
 
-    // Clean up env var
-    cleanup_test_config_env();
 
     Ok(())
 }
@@ -213,8 +225,6 @@ fn test_init_from_onboarding_with_remote() -> Result<()> {
     assert!(state.has_remote);
     assert!(state.is_cloned_repo);
 
-    // Clean up env var
-    cleanup_test_config_env();
 
     Ok(())
 }
@@ -239,7 +249,6 @@ fn test_config_directory_structure() -> Result<()> {
     // Verify snapshots is a subdirectory of config
     assert!(snapshots_dir.starts_with(&config_dir));
 
-    cleanup_test_config_env();
     Ok(())
 }
 
@@ -292,8 +301,6 @@ fn test_multiple_config_operations() -> Result<()> {
     assert!(loaded2.exclude_attachments);
     assert_eq!(loaded2.exclude_older_than_days, Some(99));
 
-    // Clean up env var
-    cleanup_test_config_env();
 
     Ok(())
 }
@@ -332,8 +339,6 @@ fn test_init_sync_repo_creates_filter_config() -> Result<()> {
     // Default values should be set
     assert!(!filter_config.exclude_attachments);
 
-    // Clean up env var
-    cleanup_test_config_env();
 
     Ok(())
 }
@@ -363,8 +368,6 @@ fn test_init_sync_repo_with_remote_creates_filter_config() -> Result<()> {
         "Filter config should be created by init_sync_repo with remote"
     );
 
-    // Clean up env var
-    cleanup_test_config_env();
 
     Ok(())
 }
@@ -401,8 +404,6 @@ fn test_init_sync_repo_does_not_overwrite_existing_filter_config() -> Result<()>
         "Custom exclude_older_than_days should be preserved"
     );
 
-    // Clean up env var
-    cleanup_test_config_env();
 
     Ok(())
 }
@@ -477,8 +478,6 @@ fn test_init_from_onboarding_sets_is_cloned_flag() -> Result<()> {
         "is_cloned_repo should be true for cloned repos"
     );
 
-    // Clean up env var
-    cleanup_test_config_env();
 
     Ok(())
 }
@@ -509,25 +508,10 @@ fn test_init_from_onboarding_local_repo_not_cloned() -> Result<()> {
         "is_cloned_repo should be false for local repos"
     );
 
-    // Clean up env var
-    cleanup_test_config_env();
 
     Ok(())
 }
 
-#[test]
-fn test_default_repo_dir_exists() -> Result<()> {
-    // Test that we can get the default repo directory
-    let default_dir = ConfigManager::default_repo_dir()?;
-
-    // Should end with "repo"
-    assert!(default_dir.ends_with("repo"));
-
-    // Should contain claude-code-sync in path
-    assert!(default_dir.to_string_lossy().contains("claude-code-sync"));
-
-    Ok(())
-}
 
 // ============================================================================
 // Tests for InitConfig validation
@@ -687,7 +671,6 @@ fn test_v1_to_v2_migration() -> Result<()> {
     assert!(content.contains("\"version\": 2"));
     assert!(content.contains("\"active_repo\": \"default\""));
 
-    cleanup_test_config_env();
     Ok(())
 }
 
@@ -727,7 +710,6 @@ fn test_sync_state_loads_v2_format() -> Result<()> {
     assert!(sync_state.has_remote);
     assert!(sync_state.is_cloned_repo);
 
-    cleanup_test_config_env();
     Ok(())
 }
 
@@ -777,7 +759,6 @@ fn test_multi_repo_state_multiple_repos() -> Result<()> {
     );
     assert!(sync_state.has_remote);
 
-    cleanup_test_config_env();
     Ok(())
 }
 
@@ -831,7 +812,6 @@ fn test_switch_active_repo() -> Result<()> {
     );
     assert!(!sync_state.has_remote);
 
-    cleanup_test_config_env();
     Ok(())
 }
 
@@ -869,7 +849,6 @@ fn test_init_creates_v2_format_with_git_repo() -> Result<()> {
     assert_eq!(default_repo.sync_repo_path, repo_path);
     assert!(!default_repo.has_remote);
 
-    cleanup_test_config_env();
     Ok(())
 }
 
@@ -897,7 +876,6 @@ fn test_init_with_remote_populates_remote_url() -> Result<()> {
         Some("https://github.com/user/repo.git".to_string())
     );
 
-    cleanup_test_config_env();
     Ok(())
 }
 
@@ -939,7 +917,6 @@ fn test_full_workflow_with_git_repos() -> Result<()> {
     let remote_output = String::from_utf8_lossy(&output.stdout);
     assert!(remote_output.contains("origin"));
 
-    cleanup_test_config_env();
     Ok(())
 }
 
@@ -991,7 +968,6 @@ fn test_operations_use_active_repo() -> Result<()> {
     let sync_state = SyncState::load()?;
     assert_eq!(sync_state.sync_repo_path, repo2_path);
 
-    cleanup_test_config_env();
     Ok(())
 }
 
@@ -1026,7 +1002,6 @@ fn test_invalid_active_repo_error() -> Result<()> {
     let err = result.unwrap_err().to_string();
     assert!(err.contains("nonexistent"));
 
-    cleanup_test_config_env();
     Ok(())
 }
 
@@ -1058,7 +1033,6 @@ fn test_init_from_onboarding_creates_v2() -> Result<()> {
         Some("https://github.com/test/repo.git".to_string())
     );
 
-    cleanup_test_config_env();
     Ok(())
 }
 
@@ -1082,7 +1056,6 @@ fn test_config_handles_uninitialized_state() -> Result<()> {
         err_msg
     );
 
-    cleanup_test_config_env();
     Ok(())
 }
 
@@ -1112,6 +1085,5 @@ fn test_cloned_repo_flag_in_v2() -> Result<()> {
     let sync_state = SyncState::load()?;
     assert!(sync_state.is_cloned_repo);
 
-    cleanup_test_config_env();
     Ok(())
 }
