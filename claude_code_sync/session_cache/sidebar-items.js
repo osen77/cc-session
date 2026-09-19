@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["FINGERPRINT_TRUST_WINDOW_SECS"],"fn":["fingerprint_file","fingerprint_trust_cutoff_secs","mtime_secs"],"struct":["CacheLoadStatus","CachedEntry","FileFingerprint","SessionIndexCache"]};

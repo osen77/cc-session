@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["enumerate","enumerate_with_probe","resolve","resolve_with_probe"],"struct":["ExternalProjectsRoot","ProjectRootMapping","ResolvedProjectRoot","VolumeIdentity"],"trait":["VolumeProbe"]};

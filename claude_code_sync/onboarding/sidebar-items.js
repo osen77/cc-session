@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["expand_tilde","is_valid_git_url"],"struct":["InitConfig","OnboardingConfig"]};
