@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["undo_pull","undo_push"]};

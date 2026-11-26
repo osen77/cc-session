@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["UNIX_WRAPPER_SCRIPT","WINDOWS_BAT_WRAPPER_SCRIPT","WINDOWS_PS1_WRAPPER_SCRIPT"],"fn":["get_install_dir","get_unix_wrapper_path","get_windows_bat_wrapper_path","get_windows_ps1_wrapper_path","get_wrapper_path","handle_wrapper_install","handle_wrapper_show","handle_wrapper_uninstall","install_unix_wrapper","is_wrapper_installed"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["codex_history_path","codex_sessions_dir","discover_codex_sessions","extract_content_text","extract_event_text","is_system_content","last_path_component","load_codex_history_titles","session_id_from_filename"],"struct":["CodexDisplayMessage","CodexEntry","CodexSession"]};

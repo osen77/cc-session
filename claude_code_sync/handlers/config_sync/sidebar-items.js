@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["auto_apply_claude_md","find_latest_device_config","handle_config_apply","handle_config_list","handle_config_push","handle_config_status","push_config_files"],"struct":["DeviceSyncInfo","SkillsList"]};

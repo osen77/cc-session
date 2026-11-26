@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CCS_DIR","CURRENT_VERSION","DELETIONS_FILE"],"enum":["DeleteReason"],"fn":["repo_root_from_registry_path","validate_repo_root"],"struct":["DeletionRecord","TombstoneRegistry"]};
