@@ -50,6 +50,8 @@ pub(crate) mod atomic_file;
 /// AppData on Windows).
 pub mod config;
 
+/// Read-only integration for Google Antigravity CLI (`agy`) session history.
+pub mod agy;
 /// Read-only parsing for Codex CLI session history.
 pub mod codex;
 pub mod omp;

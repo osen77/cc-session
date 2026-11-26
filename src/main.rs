@@ -1,3 +1,4 @@
+mod agy;
 mod atomic_file;
 mod codex;
 mod config;
@@ -381,7 +382,7 @@ enum Commands {
         #[arg(short, long, global = true)]
         project: Option<String>,
 
-        /// Filter by session source (all, claude, codex, omp)
+        /// Filter by session source (all, claude, codex, omp, agy)
         #[arg(short, long, global = true, default_value = "all")]
         source: SessionSourceArg,
 
@@ -729,6 +730,7 @@ enum SessionSourceArg {
     Claude,
     Codex,
     Omp,
+    Agy,
 }
 
 impl From<SessionSourceArg> for handlers::session::SessionSourceFilter {
@@ -738,6 +740,7 @@ impl From<SessionSourceArg> for handlers::session::SessionSourceFilter {
             SessionSourceArg::Claude => Self::Claude,
             SessionSourceArg::Codex => Self::Codex,
             SessionSourceArg::Omp => Self::Omp,
+            SessionSourceArg::Agy => Self::Agy,
         }
     }
 }
@@ -1513,6 +1516,10 @@ mod tests {
                 "codex",
             ]),
             SessionSourceArg::Codex
+        );
+        assert_eq!(
+            parse_session_source(&["ccs", "session", "search", "foo", "-s", "agy"]),
+            SessionSourceArg::Agy
         );
     }
 

@@ -34,6 +34,7 @@ impl MaintenanceRoots {
             SessionSource::Claude => &self.claude,
             SessionSource::Codex => &self.codex,
             SessionSource::Omp => &self.omp,
+            SessionSource::Agy => Path::new(""),
         }
     }
 }
@@ -61,6 +62,9 @@ pub(crate) fn recycle_session(
     requested: &MaintenanceEntry,
     now: DateTime<Utc>,
 ) -> Result<()> {
+    if requested.identity.source == SessionSource::Agy {
+        anyhow::bail!("agy sessions are read-only and cannot be recycled");
+    }
     store.reject_mapped_mutation(requested.identity.source, &requested.original_relative_path)?;
     store.transaction(|locked| {
         if locked.state.pending.is_some() {
@@ -176,6 +180,9 @@ pub(crate) fn restore_session(
     requested: &MaintenanceEntry,
     _now: DateTime<Utc>,
 ) -> Result<()> {
+    if requested.identity.source == SessionSource::Agy {
+        anyhow::bail!("agy sessions are read-only and cannot be restored");
+    }
     store.reject_mapped_mutation(requested.identity.source, &requested.original_relative_path)?;
     store.transaction(|locked| {
         if locked.state.pending.is_some() {

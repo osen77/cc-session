@@ -97,6 +97,9 @@ pub(crate) fn candidate_from_summary(
     scan_fingerprint: Option<&str>,
 ) -> Result<MaintenanceCandidate> {
     let identity = summary.identity()?;
+    if identity.source == SessionSource::Agy {
+        anyhow::bail!("agy sessions are read-only and excluded from local maintenance");
+    }
     let source_root = roots.source_root(identity.source);
     let original_relative_path = safe_relative_path_within_root(source_root, &summary.file_path)
         .context("session file is not a safe source candidate")?;
@@ -276,6 +279,9 @@ pub(crate) fn load_recycled_summaries(
                     let session = crate::omp::OmpSession::from_file(&final_path)?;
                     SessionSummary::from_omp_session(&session, &entry.project_name)
                 }
+                SessionSource::Agy => {
+                    anyhow::bail!("agy sessions do not participate in local recycling")
+                }
             };
             if !summary.is_valid() {
                 anyhow::bail!("recycled session summary is not semantically valid")
@@ -363,7 +369,7 @@ pub(crate) fn run_maintenance(
     let mut grouped: HashMap<SessionIdentity, Vec<&SessionSummary>> = HashMap::new();
     let mut validation_failed = false;
     for summary in input.summaries {
-        if mapped_summary(summary) {
+        if mapped_summary(summary) || summary.source == "agy" {
             continue;
         }
         let Ok(identity) = summary.identity() else {
@@ -684,6 +690,7 @@ mod tests {
                 SessionSource::Claude => &claude,
                 SessionSource::Codex => &codex,
                 SessionSource::Omp => &omp,
+                SessionSource::Agy => panic!("agy does not participate in maintenance fixtures"),
             };
             let source_file = source_root.join("project").join("session.jsonl");
             fs::create_dir_all(source_file.parent().unwrap()).unwrap();

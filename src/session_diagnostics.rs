@@ -78,6 +78,7 @@ pub struct ScanDiagnostics {
     pub claude_scan_ms: u64,
     pub codex_scan_ms: u64,
     pub omp_scan_ms: u64,
+    pub agy_scan_ms: u64,
     pub fingerprint_ms: u64,
     pub fingerprinted_bytes: u64,
     pub parsed_bytes: u64,
@@ -90,7 +91,7 @@ impl Serialize for ScanDiagnostics {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("ScanDiagnostics", 27)?;
+        let mut state = serializer.serialize_struct("ScanDiagnostics", 28)?;
         state.serialize_field("schema_version", &self.schema_version)?;
         state.serialize_field("diagnostic_id", &self.diagnostic_id)?;
         state.serialize_field("files_seen", &self.files_seen)?;
@@ -112,6 +113,7 @@ impl Serialize for ScanDiagnostics {
         state.serialize_field("claude_scan_ms", &self.claude_scan_ms)?;
         state.serialize_field("codex_scan_ms", &self.codex_scan_ms)?;
         state.serialize_field("omp_scan_ms", &self.omp_scan_ms)?;
+        state.serialize_field("agy_scan_ms", &self.agy_scan_ms)?;
         state.serialize_field("fingerprint_ms", &self.fingerprint_ms)?;
         state.serialize_field("fingerprinted_bytes", &self.fingerprinted_bytes)?;
         state.serialize_field("parsed_bytes", &self.parsed_bytes)?;
@@ -157,6 +159,7 @@ impl ScanDiagnostics {
             claude_scan_ms: 0,
             codex_scan_ms: 0,
             omp_scan_ms: 0,
+            agy_scan_ms: 0,
             fingerprint_ms: 0,
             fingerprinted_bytes: 0,
             parsed_bytes: 0,
@@ -278,7 +281,7 @@ pub fn stable_path_hash(path: &Path) -> String {
 
 fn normalize_source(source: Option<&str>) -> Option<String> {
     source.map(|value| match value {
-        "claude" | "codex" | "omp" => value.to_string(),
+        "claude" | "codex" | "omp" | "agy" => value.to_string(),
         _ => "unknown".to_string(),
     })
 }
@@ -585,6 +588,7 @@ mod tests {
             "claude_scan_ms",
             "codex_scan_ms",
             "omp_scan_ms",
+            "agy_scan_ms",
             "fingerprint_ms",
             "fingerprinted_bytes",
             "parsed_bytes",

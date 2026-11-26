@@ -21,6 +21,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::agy::{
+    agy_brain_dir, agy_db_path, agy_home_dir, fts_prefilter_candidates, is_agy_db_path,
+    load_db_summaries, load_display_messages_from_db, resolve_transcript_paths, AgySession,
+};
 use crate::codex::{
     codex_history_path, codex_sessions_dir, load_codex_history_titles, CodexSession,
 };
@@ -83,8 +87,7 @@ fn source_label(source: &str) -> &'static str {
 
 fn memory_dir_name_for_source(source: &str) -> &'static str {
     match source {
-        "codex" => ".memory",
-        "omp" => ".memory",
+        "codex" | "omp" | "agy" => ".memory",
         _ => "memory",
     }
 }
@@ -173,13 +176,14 @@ fn ensure_can_delete(session: &SessionSummary) -> Result<()> {
 // Core Functions
 // ============================================================================
 
-/// Filesystem roots used by the three session sources.
+/// Filesystem roots used by the supported session sources.
 #[derive(Debug, Clone)]
 pub(crate) struct SessionRoots {
     pub claude_projects: PathBuf,
     pub codex_sessions: PathBuf,
     pub codex_history: PathBuf,
     pub omp_sessions: PathBuf,
+    pub agy_root: PathBuf,
 }
 
 impl SessionRoots {
@@ -189,6 +193,7 @@ impl SessionRoots {
             codex_sessions: codex_sessions_dir()?,
             codex_history: codex_history_path()?,
             omp_sessions: omp_sessions_dir()?,
+            agy_root: agy_home_dir()?,
         })
     }
 }
@@ -388,7 +393,7 @@ fn assemble_query_summaries_with_roots(
         summaries.push(summary);
     }
 
-    if append_recycled && !active_only {
+    if append_recycled && !active_only && source.uses_index_cache() {
         let state = StateStore::from_config_dir(config_dir)
             .load()
             .context("load session maintenance state for recycled query")?;
@@ -769,33 +774,37 @@ fn scan_all_session_summaries_with_roots_mode(
 ) -> Result<SessionScanResult> {
     let started = Instant::now();
     let mut diagnostics = ScanDiagnostics::new();
-    let cache_started = Instant::now();
-    let cache_status = SessionIndexCache::load_with_status(config_dir);
-    diagnostics.cache_load_ms = elapsed_millis(cache_started);
-    let cache_warning = cache_status.warning;
-    let cache = cache_status.cache;
-    if let Some(warning) = cache_warning.as_deref() {
-        if cache_status.routine_rebuild {
-            // An upgrade that changed the cache format rebuilds the index in full and
-            // loses nothing, so it stays out of the diagnostics: counting it as an
-            // error tells the user to investigate a scan that was never incomplete.
-            // The scan-diagnostics target keeps this in the log file without printing
-            // to the terminal, so the rebuild stays traceable but invisible. The
-            // message is a fixed string and carries no path or user data.
-            log::info!(
-                target: crate::logger::SCAN_DIAGNOSTICS_TARGET,
-                "session index cache format changed; rebuilding the index"
-            );
-        } else {
-            diagnostics.record_warning(
-                None,
-                "load",
-                ScanWarningCategory::Cache,
-                Some(config_dir),
-                warning,
-            );
+    let (cache, cache_warning) = if source.uses_index_cache() {
+        let cache_started = Instant::now();
+        let cache_status = SessionIndexCache::load_with_status(config_dir);
+        diagnostics.cache_load_ms = elapsed_millis(cache_started);
+        let cache_warning = cache_status.warning;
+        if let Some(warning) = cache_warning.as_deref() {
+            if cache_status.routine_rebuild {
+                // An upgrade that changed the cache format rebuilds the index in full and
+                // loses nothing, so it stays out of the diagnostics: counting it as an
+                // error tells the user to investigate a scan that was never incomplete.
+                // The scan-diagnostics target keeps this in the log file without printing
+                // to the terminal, so the rebuild stays traceable but invisible. The
+                // message is a fixed string and carries no path or user data.
+                log::info!(
+                    target: crate::logger::SCAN_DIAGNOSTICS_TARGET,
+                    "session index cache format changed; rebuilding the index"
+                );
+            } else {
+                diagnostics.record_warning(
+                    None,
+                    "load",
+                    ScanWarningCategory::Cache,
+                    Some(config_dir),
+                    warning,
+                );
+            }
         }
-    }
+        (cache_status.cache, cache_warning)
+    } else {
+        (SessionIndexCache::empty(), None)
+    };
 
     let mut delta = CacheDelta::default();
     let mut tracker = SourceScanTracker::default();
@@ -851,6 +860,16 @@ fn scan_all_session_summaries_with_roots_mode(
         )?;
         diagnostics.omp_scan_ms = elapsed_millis(scan_started);
     }
+    if source.includes_agy() {
+        let scan_started = Instant::now();
+        scan_agy_summaries(
+            &roots.agy_root,
+            &mut summaries,
+            &mut diagnostics,
+            project_filter,
+        )?;
+        diagnostics.agy_scan_ms = elapsed_millis(scan_started);
+    }
 
     let completed_sources = tracker.completed_sources();
     let retention = tracker.retention();
@@ -859,11 +878,12 @@ fn scan_all_session_summaries_with_roots_mode(
     wait_for_test_cache_merge_gate()?;
 
     let cache_save_started = Instant::now();
-    let cache_save_result = if completed_sources.is_empty() && delta.upserts.is_empty() && delta.removals.is_empty() {
-        Ok(crate::session_cache::CacheMergeReport::default())
-    } else {
-        merge_scan_with_report(config_dir, &delta, &retention)
-    };
+    let cache_save_result =
+        if completed_sources.is_empty() && delta.upserts.is_empty() && delta.removals.is_empty() {
+            Ok(crate::session_cache::CacheMergeReport::default())
+        } else {
+            merge_scan_with_report(config_dir, &delta, &retention)
+        };
     diagnostics.cache_save_ms = elapsed_millis(cache_save_started);
     match cache_save_result {
         Ok(report) => {
@@ -902,14 +922,18 @@ fn scan_all_session_summaries_with_roots_mode(
     }
 
     summaries.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
-    let maintenance_report = maintenance_visibility_for_scan(
-        &summaries,
-        &completed_sources,
-        roots,
-        config_dir,
-        maintenance_mode,
-        &scan_fingerprints,
-    )?;
+    let maintenance_report = if source.uses_index_cache() {
+        maintenance_visibility_for_scan(
+            &summaries,
+            &completed_sources,
+            roots,
+            config_dir,
+            maintenance_mode,
+            &scan_fingerprints,
+        )?
+    } else {
+        crate::session_maintenance::MaintenanceReport::default()
+    };
     let visibility = maintenance_report.visibility.clone();
     diagnostics.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
@@ -1729,6 +1753,206 @@ fn scan_omp_summaries_cached(
     Ok(())
 }
 
+/// Scan Google Antigravity CLI (`agy`) sessions from `conversation_summaries.db` and
+/// `brain/<id>/.system_generated/logs/transcript*.jsonl`.
+///
+/// Missing `~/.gemini/antigravity-cli` or missing database files are silently skipped so
+/// environments without `agy` installed see no errors or warnings.
+fn scan_agy_summaries(
+    agy_root: &Path,
+    summaries: &mut Vec<SessionSummary>,
+    diagnostics: &mut ScanDiagnostics,
+    project_filter: Option<&str>,
+) -> Result<()> {
+    match fs::symlink_metadata(agy_root) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+        Ok(_) => {
+            diagnostics.record_warning_with_kind(
+                Some("agy"),
+                "metadata",
+                ScanWarningCategory::Io,
+                ScanWarningErrorKind::Unknown,
+                Some(agy_root),
+                "agy root must be a non-symlink directory",
+            );
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            let error = anyhow::Error::new(error);
+            diagnostics.record_warning_from_error(
+                Some("agy"),
+                "metadata",
+                ScanWarningCategory::Io,
+                Some(agy_root),
+                &error,
+            );
+            return Ok(());
+        }
+    }
+
+    let db_path = agy_db_path(agy_root);
+    let db_rows = match load_db_summaries(&db_path) {
+        Ok(rows) => rows,
+        Err(error) => {
+            diagnostics.record_warning_from_error(
+                Some("agy"),
+                "read",
+                ScanWarningCategory::Io,
+                Some(&db_path),
+                &error,
+            );
+            Vec::new()
+        }
+    };
+
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
+    for db in db_rows {
+        seen_ids.insert(db.conversation_id.clone());
+        if project_filter.is_some_and(|name| db.project_name != name) {
+            diagnostics.files_skipped += 1;
+            continue;
+        }
+
+        if let Some((show_path, summary_path)) =
+            resolve_transcript_paths(agy_root, &db.conversation_id)
+        {
+            diagnostics.files_seen += 1;
+            let parse_started = Instant::now();
+            if let Ok(meta) = fs::metadata(&summary_path) {
+                diagnostics.bytes_considered =
+                    diagnostics.bytes_considered.saturating_add(meta.len());
+                diagnostics.parsed_bytes = diagnostics.parsed_bytes.saturating_add(meta.len());
+            }
+            match AgySession::from_file_with_report(&summary_path) {
+                Ok(outcome) => {
+                    diagnostics.parse_ms = diagnostics
+                        .parse_ms
+                        .saturating_add(elapsed_millis(parse_started));
+                    diagnostics.files_parsed += 1;
+                    if outcome.malformed_lines > 0 {
+                        diagnostics.record_warning(
+                            Some("agy"),
+                            "parse",
+                            ScanWarningCategory::Data,
+                            Some(&summary_path),
+                            &format!("partial parse malformed_lines={}", outcome.malformed_lines),
+                        );
+                    }
+                    let summary =
+                        SessionSummary::from_agy_session(&outcome.value, show_path, Some(&db));
+                    if is_valid_session_summary(&summary) {
+                        summaries.push(summary);
+                    } else {
+                        diagnostics.files_skipped += 1;
+                    }
+                }
+                Err(error) => {
+                    diagnostics.parse_ms = diagnostics
+                        .parse_ms
+                        .saturating_add(elapsed_millis(parse_started));
+                    diagnostics.record_warning_from_error(
+                        Some("agy"),
+                        "parse",
+                        ScanWarningCategory::Data,
+                        Some(&summary_path),
+                        &error,
+                    );
+                    let fallback = SessionSummary::from_agy_db_only(&db, &db_path);
+                    if is_valid_session_summary(&fallback) {
+                        summaries.push(fallback);
+                    } else {
+                        diagnostics.files_skipped += 1;
+                    }
+                }
+            }
+        } else {
+            let summary = SessionSummary::from_agy_db_only(&db, &db_path);
+            if is_valid_session_summary(&summary) {
+                diagnostics.files_seen += 1;
+                summaries.push(summary);
+            } else {
+                diagnostics.files_skipped += 1;
+            }
+        }
+    }
+
+    // Fallback scan for brain transcripts that are not present in conversation_summaries.db
+    // (for example, when the DB is absent or a session has not flushed to SQLite yet).
+    let brain_dir = agy_brain_dir(agy_root);
+    if matches!(
+        fs::symlink_metadata(&brain_dir),
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink()
+    ) {
+        if let Ok(entries) = fs::read_dir(&brain_dir) {
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_dir() || file_type.is_symlink() {
+                    continue;
+                }
+                let Some(conv_id) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if conv_id.starts_with('.') || !seen_ids.insert(conv_id.clone()) {
+                    continue;
+                }
+                let Some((show_path, summary_path)) = resolve_transcript_paths(agy_root, &conv_id)
+                else {
+                    continue;
+                };
+                diagnostics.files_seen += 1;
+                let parse_started = Instant::now();
+                match AgySession::from_file_with_report(&summary_path) {
+                    Ok(outcome) => {
+                        diagnostics.parse_ms = diagnostics
+                            .parse_ms
+                            .saturating_add(elapsed_millis(parse_started));
+                        diagnostics.files_parsed += 1;
+                        if outcome.malformed_lines > 0 {
+                            diagnostics.record_warning(
+                                Some("agy"),
+                                "parse",
+                                ScanWarningCategory::Data,
+                                Some(&summary_path),
+                                &format!(
+                                    "partial parse malformed_lines={}",
+                                    outcome.malformed_lines
+                                ),
+                            );
+                        }
+                        let summary =
+                            SessionSummary::from_agy_session(&outcome.value, show_path, None);
+                        if project_filter.is_some_and(|name| summary.project_name != name)
+                            || !is_valid_session_summary(&summary)
+                        {
+                            diagnostics.files_skipped += 1;
+                        } else {
+                            summaries.push(summary);
+                        }
+                    }
+                    Err(error) => {
+                        diagnostics.parse_ms = diagnostics
+                            .parse_ms
+                            .saturating_add(elapsed_millis(parse_started));
+                        diagnostics.record_warning_from_error(
+                            Some("agy"),
+                            "parse",
+                            ScanWarningCategory::Data,
+                            Some(&summary_path),
+                            &error,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Get filtered (invalid) sessions for cleanup
 pub fn get_filtered_sessions(project: &ProjectSummary) -> Result<Vec<SessionSummary>> {
     let filter = FilterConfig::no_size_limit();
@@ -1904,8 +2128,8 @@ fn repo_relative_path_from_root(
     filter: &FilterConfig,
     claude_dir: &Path,
 ) -> Result<Option<PathBuf>> {
-    // Codex and OMP sessions live outside ~/.claude/projects/ and are not synced.
-    if session.source == "codex" || session.source == "omp" {
+    // Codex, OMP, and Agy sessions live outside ~/.claude/projects/ and are not synced.
+    if session.source == "codex" || session.source == "omp" || session.source == "agy" {
         return Ok(None);
     }
 
@@ -2444,10 +2668,10 @@ fn show_action_menu(session: &SessionSummary) -> Result<ActionChoice> {
 
     let source = session.source_kind()?;
     let actions = action_choices_for_source(source);
-    let open_label = if source == SessionSource::Omp {
-        "Open in OMP"
-    } else {
-        "Open in Claude"
+    let open_label = match source {
+        SessionSource::Omp => "Open in OMP",
+        SessionSource::Agy => "Open in Agy",
+        _ => "Open in Claude",
     };
     let labels: Vec<String> = actions
         .iter()
@@ -2590,15 +2814,18 @@ fn save_user_data(data: &UserData) -> Result<()> {
 /// based on the session source. Returns: Ok(true) = executed command, Ok(false) = cancelled
 fn open_in_editor(session: &SessionSummary) -> Result<bool> {
     // Get project path from session's cwd field
-    let project_path = if let Ok(conv) = ConversationSession::from_file(&session.file_path) {
-        conv.cwd().map(|s| s.to_string())
-    } else {
-        None
-    };
+    let project_path = session.cwd.clone().or_else(|| {
+        if let Ok(conv) = ConversationSession::from_file(&session.file_path) {
+            conv.cwd().map(|s| s.to_string())
+        } else {
+            None
+        }
+    });
 
     // Build default command based on session source
     let default_cmd = match session.source.as_str() {
         "omp" => format!("omp --resume {}", session.session_id),
+        "agy" => format!("agy --resume {}", session.session_id),
         _ => format!("claude --resume {}", session.session_id),
     };
 
@@ -3662,6 +3889,12 @@ pub fn handle_session_overview(
                     .iter()
                     .find(|s| s.source == "omp" && !s.project_dir.as_os_str().is_empty())
                     .map(|s| s.project_dir.display().to_string())
+            })
+            .or_else(|| {
+                project_sessions
+                    .iter()
+                    .find(|s| s.source == "agy" && !s.project_dir.as_os_str().is_empty())
+                    .map(|s| s.project_dir.display().to_string())
             });
 
         let description = project_path
@@ -3689,6 +3922,9 @@ pub fn handle_session_overview(
         let memory = project_sessions
             .iter()
             .find_map(|s| {
+                if s.project_dir.as_os_str().is_empty() {
+                    return None;
+                }
                 let entries = read_memory_entries(&s.project_dir, &s.source, 10);
                 (!entries.is_empty()).then_some(entries)
             })
@@ -4264,6 +4500,27 @@ fn collect_display_messages_for_summary(
             .collect();
     }
 
+    if session.source == "agy" {
+        let agy_messages = if is_agy_db_path(&session.file_path) {
+            load_display_messages_from_db(&session.file_path, &session.session_id)
+                .unwrap_or_default()
+        } else {
+            AgySession::from_file(&session.file_path)
+                .map(|conv| conv.display_messages())
+                .unwrap_or_default()
+        };
+        return agy_messages
+            .into_iter()
+            .enumerate()
+            .map(|(idx, message)| DisplayMessage {
+                index: idx + 1,
+                role: message.role,
+                timestamp: message.timestamp,
+                content: message.content,
+            })
+            .collect();
+    }
+
     ConversationSession::from_file(&session.file_path)
         .map(|conv| collect_display_messages(&conv, full_content))
         .unwrap_or_default()
@@ -4300,6 +4557,30 @@ fn extract_recent_messages_for_summary(
         };
         let mut messages: Vec<String> = conv
             .display_messages()
+            .into_iter()
+            .rev()
+            .filter(|m| m.role == "user")
+            .filter_map(|m| {
+                let text = m.content.replace('\n', " ");
+                let text = text.trim().to_string();
+                (text.chars().count() >= min_chars).then(|| truncate_chars(&text, 100))
+            })
+            .take(count)
+            .collect();
+        messages.reverse();
+        return messages;
+    }
+
+    if session.source == "agy" {
+        let agy_messages = if is_agy_db_path(&session.file_path) {
+            load_display_messages_from_db(&session.file_path, &session.session_id)
+                .unwrap_or_default()
+        } else {
+            AgySession::from_file(&session.file_path)
+                .map(|conv| conv.display_messages())
+                .unwrap_or_default()
+        };
+        let mut messages: Vec<String> = agy_messages
             .into_iter()
             .rev()
             .filter(|m| m.role == "user")
@@ -4701,15 +4982,40 @@ fn search_sessions_full(
     context_chars: usize,
     user_only: bool,
 ) -> Vec<SessionSearchResult> {
+    search_sessions_full_with_agy_db(sessions, keywords, context_chars, user_only, false, None)
+}
+
+fn search_sessions_full_with_agy_db(
+    sessions: &[SessionSummary],
+    keywords: &[&str],
+    context_chars: usize,
+    user_only: bool,
+    phrase: bool,
+    agy_db_path: Option<&Path>,
+) -> Vec<SessionSearchResult> {
     let keywords_lower: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
     let keywords_chars: Vec<Vec<char>> = keywords_lower
         .iter()
         .map(|k| k.chars().collect::<Vec<char>>())
         .collect();
     let multi_keyword = keywords_lower.len() > 1;
+    let agy_prefilter = agy_db_path.and_then(|db| {
+        sessions
+            .iter()
+            .any(|s| s.source == "agy")
+            .then(|| fts_prefilter_candidates(db, keywords, user_only, phrase))
+            .flatten()
+    });
     let mut results = Vec::new();
 
     for session in sessions {
+        if session.source == "agy" {
+            if let Some(ref prefilter) = agy_prefilter {
+                if !prefilter.should_scan_session(&session.session_id, &session.file_path) {
+                    continue;
+                }
+            }
+        }
         let mut and_matches = Vec::new();
         let mut or_matches = Vec::new();
         let mut best_gap: Option<usize> = None;
@@ -4883,8 +5189,16 @@ pub fn handle_session_search(
         });
     }
 
-    // 5. Search sessions
-    let session_results = search_sessions_full(&all_sessions, keywords, context_chars, user_only);
+    // 5. Search sessions (using agy FTS5 index to pre-filter indexed agy sessions)
+    let agy_db = agy_home_dir().ok().map(|root| agy_db_path(&root));
+    let session_results = search_sessions_full_with_agy_db(
+        &all_sessions,
+        keywords,
+        context_chars,
+        user_only,
+        phrase,
+        agy_db.as_deref(),
+    );
     diagnostics.search_load_ms = elapsed_millis(search_started);
 
     // 6. Count totals
@@ -6650,6 +6964,7 @@ mod tests {
             codex_sessions: temp.path().join("codex/sessions"),
             codex_history: temp.path().join("codex/history.jsonl"),
             omp_sessions: temp.path().join("omp/sessions"),
+            agy_root: temp.path().join("agy"),
         };
         assert!(roots.claude_projects.ends_with("claude"));
     }
@@ -7958,6 +8273,7 @@ mod tests {
             codex_sessions: temp.path().join("codex/sessions"),
             codex_history: temp.path().join("codex/history.jsonl"),
             omp_sessions,
+            agy_root: temp.path().join("agy"),
         };
         let config = temp.path().join("config");
         (temp, roots, config)
@@ -8341,6 +8657,7 @@ mod tests {
             codex_sessions: codex_root,
             codex_history: temp.path().join("codex/history.jsonl"),
             omp_sessions: omp_root,
+            agy_root: temp.path().join("missing-agy"),
         };
         let config = temp.path().join("config");
 
@@ -8447,6 +8764,7 @@ mod tests {
             codex_sessions: temp.path().join("missing-codex"),
             codex_history: temp.path().join("missing-history.jsonl"),
             omp_sessions: temp.path().join("missing-omp"),
+            agy_root: temp.path().join("missing-agy"),
         };
         let config = temp.path().join("config");
         let first = scan_all_session_summaries_with_roots(
@@ -8597,6 +8915,7 @@ mod tests {
             codex_sessions: temp.path().join("missing-codex"),
             codex_history: temp.path().join("missing-history.jsonl"),
             omp_sessions: temp.path().join("missing-omp"),
+            agy_root: temp.path().join("missing-agy"),
         };
         let config = temp.path().join("config");
         let first = scan_all_session_summaries_with_roots(
@@ -8651,6 +8970,7 @@ mod tests {
             codex_sessions: temp.path().join("missing-codex"),
             codex_history: temp.path().join("missing-history.jsonl"),
             omp_sessions: temp.path().join("missing-omp"),
+            agy_root: temp.path().join("missing-agy"),
         };
         let config = temp.path().join("config");
         scan_all_session_summaries_with_roots(None, SessionSourceFilter::Claude, &roots, &config)
@@ -8703,6 +9023,7 @@ mod tests {
             codex_sessions: temp.path().join("missing-codex"),
             codex_history: temp.path().join("missing-history.jsonl"),
             omp_sessions: temp.path().join("missing-omp"),
+            agy_root: temp.path().join("missing-agy"),
         };
         let config = temp.path().join("config");
         scan_all_session_summaries_with_roots(None, SessionSourceFilter::Claude, &roots, &config)
@@ -8781,6 +9102,7 @@ mod tests {
             codex_sessions: roots.codex_sessions.clone(),
             codex_history: roots.codex_history.clone(),
             omp_sessions: roots.omp_sessions.clone(),
+            agy_root: roots.agy_root.clone(),
         };
         let second = scan_all_session_summaries_with_roots(
             None,
@@ -8848,6 +9170,7 @@ mod tests {
             codex_sessions: roots.codex_sessions,
             codex_history: roots.codex_history,
             omp_sessions: roots.omp_sessions,
+            agy_root: roots.agy_root,
         };
         let mut filter = FilterConfig::default();
         filter.session_maintenance.enabled = false;
@@ -8919,12 +9242,26 @@ mod tests {
             let child = new_target.join("-nested");
             fs::create_dir(&child).unwrap();
             symlink(&child, local.join("-nested")).unwrap();
-            filter.project_roots.push(crate::project_roots::ProjectRootMapping {
-                project_dir: "-nested".into(), target: child, trusted_root: new_target,
-                volume_uuid: filter.project_roots[0].volume_uuid.clone(),
-            });
-            fs::write(config.join("config.toml"), toml::to_string(&filter).unwrap()).unwrap();
-            let rejected = scan_all_session_summaries_with_roots(None, SessionSourceFilter::Claude, &mapped_roots, &config).unwrap();
+            filter
+                .project_roots
+                .push(crate::project_roots::ProjectRootMapping {
+                    project_dir: "-nested".into(),
+                    target: child,
+                    trusted_root: new_target,
+                    volume_uuid: filter.project_roots[0].volume_uuid.clone(),
+                });
+            fs::write(
+                config.join("config.toml"),
+                toml::to_string(&filter).unwrap(),
+            )
+            .unwrap();
+            let rejected = scan_all_session_summaries_with_roots(
+                None,
+                SessionSourceFilter::Claude,
+                &mapped_roots,
+                &config,
+            )
+            .unwrap();
             assert!(rejected.diagnostics.degraded());
             assert!(!rejected.completed_sources.contains(&SessionSource::Claude));
             assert_eq!(fs::read(config.join("session_index.json")).unwrap(), before);
@@ -8939,6 +9276,7 @@ mod tests {
             codex_sessions: temp.path().join("missing-codex"),
             codex_history: temp.path().join("missing-history.jsonl"),
             omp_sessions: temp.path().join("missing-omp"),
+            agy_root: temp.path().join("missing-agy"),
         };
         let config = temp.path().join("config");
         let report = scan_all_session_summaries_with_roots(
@@ -8980,6 +9318,7 @@ mod tests {
             codex_sessions: temp.path().join("missing-codex"),
             codex_history: temp.path().join("missing-history.jsonl"),
             omp_sessions: temp.path().join("missing-omp"),
+            agy_root: temp.path().join("missing-agy"),
         };
         let config = temp.path().join("config");
 
@@ -9245,6 +9584,7 @@ mod tests {
             codex_sessions: temp.path().join("missing-codex"),
             codex_history: temp.path().join("missing-history.jsonl"),
             omp_sessions: temp.path().join("missing-omp"),
+            agy_root: temp.path().join("missing-agy"),
         };
         let report = scan_all_session_summaries_with_roots(
             Some("wanted"),
@@ -9369,6 +9709,7 @@ mod tests {
             codex_sessions: temp.path().join("codex"),
             codex_history: temp.path().join("history.jsonl"),
             omp_sessions: temp.path().join("omp"),
+            agy_root: temp.path().join("agy"),
         };
         let config = temp.path().join("config");
         let report = scan_all_session_summaries_with_roots(

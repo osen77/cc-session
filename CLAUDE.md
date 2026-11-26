@@ -140,23 +140,25 @@ cwd.split(&['/', '\\'])
 - `ccs update --check-only` 仅检查
 - 自动下载并替换当前二进制
 
-### 5.1 会话来源 (`handlers/session.rs`, `codex.rs`, `omp.rs`)
+### 5.1 会话来源 (`handlers/session.rs`, `codex.rs`, `omp.rs`, `agy.rs`)
 
-`ccs session` 非交互命令支持三类历史来源：
+`ccs session` 非交互命令支持四类历史来源：
 
 - `CC`: Claude Code，读取 `~/.claude/projects/`
 - `CX`: Codex，读取 `~/.codex/sessions/`，标题辅助来自 `~/.codex/history.jsonl`
 - `OM`: OMP (Oh My Pi)，读取 `~/.omp/agent/sessions/`
+- `AG`: Google Antigravity CLI (`agy`)，只读读取 `~/.gemini/antigravity-cli/conversation_summaries.db`（WAL-safe SQLite 元数据与 `conversations_fts` FTS5 预过滤）及 `brain/<id>/.system_generated/logs/transcript_full.jsonl`（回退 `transcript.jsonl`）
 
-使用 `--source all|claude|codex|omp` 过滤来源，默认 `all`。能力矩阵：
+使用 `--source all|claude|codex|omp|agy` 过滤来源，默认 `all`。能力矩阵：
 
 | 来源 | 查询 | 打开 | 重命名 | 显式删除 | 本地维护 | 参与同步 |
 |------|------|------|--------|----------|----------|----------|
 | Claude Code | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Codex | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
 | OMP | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
+| Agy | ✅ | ✅ | ❌ | ❌ | ❌（只读） | ❌ |
 
-Codex/OMP 的普通 rename/delete 仍为只读；本地维护只移动和恢复其本机 JSONL，不授予通用删除能力。二者位于 `~/.claude/projects/` 之外，不参与同步（`repo_relative_path` 返回 `None`）。
+Codex/OMP/Agy 的普通 rename/delete 均为只读；Agy 由其自有 SQLite 索引库管理，不进入 `session_index.json` 缓存，也不参与本地回收维护；三者位于 `~/.claude/projects/` 之外，均不参与同步（`repo_relative_path` 返回 `None`）。
 
 ### 5.2 测试会话维护 (`session_maintenance/`, `handlers/session.rs`)
 

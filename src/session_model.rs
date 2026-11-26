@@ -1,5 +1,6 @@
 //! Stable domain types shared by session scanning, cache, and maintenance.
 
+use crate::agy::{AgyDbSummary, AgySession};
 use crate::codex::CodexSession;
 use crate::omp::OmpSession;
 use crate::parser::ConversationSession;
@@ -17,6 +18,8 @@ pub enum SessionSource {
     Codex,
     /// Oh My Pi session.
     Omp,
+    /// Google Antigravity CLI (`agy`) session.
+    Agy,
 }
 
 /// Operations supported by a session source.
@@ -39,6 +42,7 @@ impl SessionSource {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Omp => "omp",
+            Self::Agy => "agy",
         }
     }
 
@@ -48,6 +52,7 @@ impl SessionSource {
             Self::Claude => "CC",
             Self::Codex => "CX",
             Self::Omp => "OM",
+            Self::Agy => "AG",
         }
     }
 
@@ -72,6 +77,12 @@ impl SessionSource {
                 can_delete: false,
                 participates_in_sync: false,
             },
+            Self::Agy => SourceCapabilities {
+                can_open: true,
+                can_rename: false,
+                can_delete: false,
+                participates_in_sync: false,
+            },
         }
     }
 }
@@ -84,6 +95,7 @@ impl TryFrom<&str> for SessionSource {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
             "omp" => Ok(Self::Omp),
+            "agy" => Ok(Self::Agy),
             other => anyhow::bail!("Unknown session source: {other}"),
         }
     }
@@ -109,6 +121,8 @@ pub enum SessionSourceFilter {
     Codex,
     /// Include only Oh My Pi sessions.
     Omp,
+    /// Include only Google Antigravity CLI (`agy`) sessions.
+    Agy,
 }
 
 impl SessionSourceFilter {
@@ -119,6 +133,7 @@ impl SessionSourceFilter {
                 | (Self::Claude, SessionSource::Claude)
                 | (Self::Codex, SessionSource::Codex)
                 | (Self::Omp, SessionSource::Omp)
+                | (Self::Agy, SessionSource::Agy)
         )
     }
 
@@ -132,6 +147,15 @@ impl SessionSourceFilter {
 
     pub(crate) fn includes_omp(self) -> bool {
         matches!(self, Self::All | Self::Omp)
+    }
+
+    pub(crate) fn includes_agy(self) -> bool {
+        matches!(self, Self::All | Self::Agy)
+    }
+
+    /// Whether this filter selects any source backed by `session_index.json`.
+    pub(crate) fn uses_index_cache(self) -> bool {
+        self.includes_claude() || self.includes_codex() || self.includes_omp()
     }
 }
 
@@ -351,6 +375,100 @@ impl SessionSummary {
             first_timestamp: session.first_timestamp(),
             last_activity: session.latest_timestamp(),
             file_size,
+            has_custom_title: false,
+        }
+    }
+
+    /// Create a SessionSummary from an `agy` transcript, optionally enriched with SQLite metadata.
+    pub fn from_agy_session(
+        session: &AgySession,
+        show_path: PathBuf,
+        db: Option<&AgyDbSummary>,
+    ) -> Self {
+        let file_size = fs::metadata(&show_path).map(|m| m.len()).unwrap_or(0);
+        let messages = session.display_messages();
+        let user_count = messages.iter().filter(|m| m.role == "user").count();
+        let assistant_count = messages.iter().filter(|m| m.role == "assistant").count();
+        let title = session.title_from_messages(
+            &messages,
+            db.map(|d| d.title.as_str()),
+            db.map(|d| d.preview.as_str()),
+        );
+        let cwd = db
+            .and_then(|d| d.cwd.clone())
+            .or_else(|| session.cwd.clone());
+        let project_name = db
+            .map(|d| d.project_name.clone())
+            .or_else(|| session.project_name().map(str::to_string))
+            .unwrap_or_else(|| "agy".to_string());
+        let project_dir = cwd.as_deref().map(PathBuf::from).unwrap_or_default();
+        let last_activity = match (
+            db.and_then(|d| d.last_modified_time.clone()),
+            session.latest_timestamp(),
+        ) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        };
+        let first_timestamp = session
+            .first_timestamp()
+            .or_else(|| db.and_then(|d| d.last_user_input_time.clone()))
+            .or_else(|| last_activity.clone());
+
+        SessionSummary {
+            source: SessionSource::Agy.as_str().to_string(),
+            session_id: session.session_id.clone(),
+            title,
+            project_name,
+            project_dir,
+            cwd,
+            file_path: show_path,
+            message_count: user_count + assistant_count,
+            user_message_count: user_count,
+            assistant_message_count: assistant_count,
+            first_timestamp,
+            last_activity,
+            file_size,
+            has_custom_title: false,
+        }
+    }
+
+    /// Create a SessionSummary from an `agy` SQLite metadata row when no transcript file exists.
+    pub fn from_agy_db_only(db: &AgyDbSummary, db_path: &Path) -> Self {
+        let title = if !db.title.is_empty() {
+            db.title.clone()
+        } else if !db.preview.is_empty() {
+            db.preview.clone()
+        } else {
+            "(No title)".to_string()
+        };
+        let has_content = !db.preview.is_empty() || !db.title.is_empty();
+        let (user_count, message_count) = if has_content && db.parent_conversation_id.is_empty() {
+            (1, db.step_count.max(1))
+        } else {
+            (0, 0)
+        };
+        let assistant_count = message_count.saturating_sub(user_count);
+        let project_dir = db.cwd.as_deref().map(PathBuf::from).unwrap_or_default();
+        let first_timestamp = db
+            .last_user_input_time
+            .clone()
+            .or_else(|| db.last_modified_time.clone());
+
+        SessionSummary {
+            source: SessionSource::Agy.as_str().to_string(),
+            session_id: db.conversation_id.clone(),
+            title,
+            project_name: db.project_name.clone(),
+            project_dir,
+            cwd: db.cwd.clone(),
+            file_path: db_path.to_path_buf(),
+            message_count,
+            user_message_count: user_count,
+            assistant_message_count: assistant_count,
+            first_timestamp,
+            last_activity: db.last_modified_time.clone(),
+            file_size: 0,
             has_custom_title: false,
         }
     }
